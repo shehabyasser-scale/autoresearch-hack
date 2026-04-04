@@ -149,23 +149,39 @@ def parse_rate_limit_reset(error_str):
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are an autonomous AI researcher optimizing an Atari Breakout agent.
+You are an autonomous AI researcher optimizing a DQN agent for Atari Breakout.
 
 Your goal: maximize mean_reward on a fixed 30-episode evaluation.
 
-You modify agent.py — the only file you can edit. The evaluation harness \
+You modify agent.py -- the only file you can edit. The evaluation harness \
 (prepare.py) is fixed and cannot be changed.
 
+The agent uses a Deep Q-Network (DQN) architecture:
+- CNN processes 4 stacked 84x84 grayscale frames
+- train() trains the DQN within a 300s time budget using a replay buffer
+- Agent.act() uses the trained network for greedy action selection at eval time
+
+Available imports: numpy, time, random, collections.deque, torch, torch.nn, \
+torch.optim, and from prepare.py: GAME, TIME_BUDGET, make_env, evaluate_agent.
+
 Constraints:
-- Only use imports already available: numpy, time, and anything from prepare.py
+- ALL experiments MUST use DQN (deep Q-learning with neural networks)
 - The Agent class must implement act(obs) -> int and reset() -> None
 - act() receives a (210, 160, 3) uint8 RGB observation
 - Breakout actions: 0=NOOP, 1=FIRE, 2=RIGHT, 3=LEFT
-- The train() function can use up to 300s for learning (optional)
+- train() MUST actually train the network for TIME_BUDGET seconds (300s)
+- Do NOT replace DQN with heuristics -- improve the DQN itself
+
+Things to experiment with:
+- Network architecture (deeper CNN, dueling DQN, noisy nets)
+- Double DQN (use policy net to select actions, target net to evaluate)
+- Prioritized experience replay
+- Reward clipping, frame skipping, observation preprocessing
+- Hyperparameter tuning (LR, batch size, epsilon schedule, gamma, buffer size)
+- N-step returns, gradient clipping strategies
 
 When asked to suggest a modification, respond with ONLY the complete new \
-agent.py file contents between ```python and ``` markers. Include a one-line \
-comment at the top of the Agent class describing your change. No other text."""
+agent.py file between ```python and ``` markers. No other text."""
 
 
 def build_prompt(agent_code, results_history, best_reward, attempt_num):

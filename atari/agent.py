@@ -1,366 +1,165 @@
 """
-Atari agent — the file the AI researcher modifies.
-
-This is the equivalent of train.py in the LLM autoresearch setup.
-Modify anything here: the agent's strategy, observation preprocessing,
-internal state, heuristics, learned components, etc.
-
+Atari DQN agent -- the file the AI researcher modifies.
 Usage: python agent.py
 """
 
 import time
+import random
+from collections import deque
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from prepare import GAME, TIME_BUDGET, make_env, evaluate_agent
 
-# ---------------------------------------------------------------------------
-# Agent (MODIFY THIS)
-# ---------------------------------------------------------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def preprocess(obs):
+    gray = np.mean(obs[32:195, :, :], axis=2).astype(np.float32)
+    gray = gray[::2, ::2]
+    result = np.zeros((84, 84), dtype=np.float32)
+    rh, rw = min(gray.shape[0], 84), min(gray.shape[1], 84)
+    result[:rh, :rw] = gray[:rh, :rw]
+    return result / 255.0
+
+class DQN(nn.Module):
+    def __init__(self, num_actions=4):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(4, 16, kernel_size=8, stride=4), nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=4, stride=2), nn.ReLU(),
+        )
+        dummy = torch.zeros(1, 4, 84, 84)
+        conv_out = self.conv(dummy).view(1, -1).shape[1]
+        self.fc = nn.Sequential(nn.Linear(conv_out, 256), nn.ReLU(), nn.Linear(256, num_actions))
+
+    def forward(self, x):
+        return self.fc(self.conv(x).view(x.size(0), -1))
+
+class ReplayBuffer:
+    def __init__(self, capacity=50000):
+        self.buffer = deque(maxlen=capacity)
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        s, a, r, ns, d = zip(*batch)
+        return np.array(s), np.array(a), np.array(r, dtype=np.float32), np.array(ns), np.array(d, dtype=np.float32)
+    def __len__(self):
+        return len(self.buffer)
+
+BATCH_SIZE = 32
+GAMMA = 0.99
+LR = 1e-4
+EPSILON_START = 1.0
+EPSILON_END = 0.05
+EPSILON_DECAY_STEPS = 50000
+TARGET_UPDATE_FREQ = 1000
+REPLAY_MIN_SIZE = 1000
+REPLAY_CAPACITY = 50000
+
+policy_net = None
+target_net = None
 
 class Agent:
-    # Robust multi-method ball detection with simplified but more reliable positioning strategy
-    """
-    Atari Breakout agent.
-
-    The AI researcher should modify this class to maximize mean_reward
-    on the fixed evaluation harness (30 episodes of Breakout-v5).
-
-    Interface:
-        agent.act(obs) -> action (int)
-        agent.reset()  -> None (called at start of each episode)
-    """
-
     def __init__(self, action_space):
         self.action_space = action_space
-        # Breakout actions: 0=NOOP, 1=FIRE, 2=RIGHT, 3=LEFT
-        self.noop = 0
-        self.fire = 1
-        self.right = 2
-        self.left = 3
-
+        self.frame_stack = deque(maxlen=4)
     def reset(self):
-        """Called at the start of each episode."""
-        self._steps = 0
-        self._fired = False
-        self._ball_positions = []
-        self._no_ball_count = 0
-        self._last_paddle_x = 80.0
-        self._last_action = self.noop
-        self._ball_lost_frames = 0
-        self._ball_velocity = (0, 0)
-        self._last_ball_pos = None
-        self._consistent_velocity = (0, 0)
-        self._velocity_confidence = 0.0
-
+        self.frame_stack.clear()
+    def _get_state(self, obs):
+        frame = preprocess(obs)
+        while len(self.frame_stack) < 4:
+            self.frame_stack.append(frame)
+        self.frame_stack.append(frame)
+        return np.array(self.frame_stack, dtype=np.float32)
     def act(self, obs):
-        """
-        Given a (210, 160, 3) uint8 RGB observation, return an action.
-        
-        Robust strategy with multi-method ball detection and reliable positioning.
-        """
-        self._steps += 1
-
-        # Fire to launch the ball at the start
-        if not self._fired:
-            self._fired = True
-            return self.fire
-
-        # Find ball and paddle positions using multiple methods
-        ball_pos = self._find_ball_multi_method(obs)
-        paddle_x = self._find_paddle_x(obs)
-        self._last_paddle_x = paddle_x
-
-        if ball_pos is None:
-            self._no_ball_count += 1
-            self._ball_lost_frames += 1
-            self._velocity_confidence *= 0.8
-            
-            # Emergency ball recovery
-            if self._ball_lost_frames > 15:
-                return self.fire
-            
-            # Use last known trajectory if confident
-            if self._velocity_confidence > 0.5 and self._last_ball_pos is not None:
-                predicted_x = self._predict_from_last_known()
-                if predicted_x is not None:
-                    return self._move_towards_target(paddle_x, predicted_x, urgent=True)
-            
-            # Default positioning when ball is lost
-            center_x = 80
-            return self._move_towards_target(paddle_x, center_x, urgent=False)
-        else:
-            ball_x, ball_y = ball_pos
-            self._no_ball_count = 0
-            self._ball_lost_frames = 0
-
-        # Update ball tracking
-        self._update_ball_tracking(ball_x, ball_y)
-
-        # Calculate target position
-        target_x = self._calculate_target_position(ball_x, ball_y, paddle_x)
-        
-        # Determine urgency based on ball position and velocity
-        urgent = ball_y > 70 or abs(self._consistent_velocity[1]) > 2.5
-        
-        return self._move_towards_target(paddle_x, target_x, urgent)
-
-    def _find_ball_multi_method(self, obs):
-        """Multi-method ball detection for robustness."""
-        # Method 1: Standard bright pixel detection
-        ball_pos = self._find_ball_method1(obs)
-        if ball_pos is not None:
-            return ball_pos
-            
-        # Method 2: Color-based detection
-        ball_pos = self._find_ball_method2(obs)
-        if ball_pos is not None:
-            return ball_pos
-            
-        # Method 3: Edge-based detection
-        ball_pos = self._find_ball_method3(obs)
-        return ball_pos
-
-    def _find_ball_method1(self, obs):
-        """Standard bright pixel detection."""
-        field = obs[95:180, 8:152, :]
-        brightness = np.max(field, axis=2)
-        bright_pixels = brightness > 180
-        coords = np.argwhere(bright_pixels)
-        
-        if len(coords) == 0 or len(coords) > 20:
-            return None
-            
-        y_center = float(np.mean(coords[:, 0])) + 95
-        x_center = float(np.mean(coords[:, 1])) + 8
-        return (x_center, y_center)
-
-    def _find_ball_method2(self, obs):
-        """Color-based detection looking for white/bright objects."""
-        field = obs[95:180, 8:152, :]
-        r, g, b = field[:, :, 0], field[:, :, 1], field[:, :, 2]
-        
-        # Look for white-ish pixels
-        white_mask = (r > 160) & (g > 160) & (b > 160)
-        # Also look for very bright pixels in any channel
-        bright_mask = (r > 200) | (g > 200) | (b > 200)
-        
-        ball_mask = white_mask | bright_mask
-        coords = np.argwhere(ball_mask)
-        
-        if len(coords) == 0 or len(coords) > 25:
-            return None
-            
-        y_center = float(np.mean(coords[:, 0])) + 95
-        x_center = float(np.mean(coords[:, 1])) + 8
-        return (x_center, y_center)
-
-    def _find_ball_method3(self, obs):
-        """Edge-based detection for small moving objects."""
-        field = obs[95:180, 8:152, :]
-        gray = np.mean(field, axis=2)
-        
-        # Simple edge detection
-        edges_y = np.abs(np.diff(gray, axis=0))
-        edges_x = np.abs(np.diff(gray, axis=1))
-        
-        # Pad to maintain shape
-        edges_y = np.pad(edges_y, ((0, 1), (0, 0)), mode='constant')
-        edges_x = np.pad(edges_x, ((0, 0), (0, 1)), mode='constant')
-        
-        edge_strength = edges_y + edges_x
-        strong_edges = edge_strength > 30
-        
-        coords = np.argwhere(strong_edges)
-        
-        if len(coords) == 0 or len(coords) > 15:
-            return None
-            
-        y_center = float(np.mean(coords[:, 0])) + 95
-        x_center = float(np.mean(coords[:, 1])) + 8
-        return (x_center, y_center)
-
-    def _update_ball_tracking(self, ball_x, ball_y):
-        """Update ball position and velocity tracking."""
-        current_pos = (ball_x, ball_y, self._steps)
-        self._ball_positions.append(current_pos)
-        if len(self._ball_positions) > 5:
-            self._ball_positions.pop(0)
-
-        # Calculate velocity with smoothing
-        if len(self._ball_positions) >= 2:
-            prev_pos = self._ball_positions[-2]
-            dt = max(1, current_pos[2] - prev_pos[2])
-            vx = (current_pos[0] - prev_pos[0]) / dt
-            vy = (current_pos[1] - prev_pos[1]) / dt
-            self._ball_velocity = (vx, vy)
-            
-            # Update consistent velocity with exponential smoothing
-            alpha = 0.3
-            self._consistent_velocity = (
-                alpha * vx + (1 - alpha) * self._consistent_velocity[0],
-                alpha * vy + (1 - alpha) * self._consistent_velocity[1]
-            )
-            
-            # Update velocity confidence
-            if len(self._ball_positions) >= 3:
-                self._velocity_confidence = min(1.0, self._velocity_confidence + 0.2)
-            
-        self._last_ball_pos = current_pos
-
-    def _calculate_target_position(self, ball_x, ball_y, paddle_x):
-        """Calculate optimal target position."""
-        if len(self._ball_positions) < 2:
-            return ball_x
-            
-        vx, vy = self._consistent_velocity
-        
-        # Simple intercept calculation
-        paddle_y = 189
-        if ball_y >= paddle_y or abs(vy) < 0.1:
-            return ball_x
-            
-        # Time to intercept
-        time_to_intercept = (paddle_y - ball_y) / max(0.5, abs(vy))
-        
-        # Predicted position with wall bounces
-        predicted_x = ball_x + vx * time_to_intercept
-        
-        # Handle wall bounces
-        left_wall, right_wall = 8, 152
-        bounce_count = 0
-        
-        while (predicted_x < left_wall or predicted_x > right_wall) and bounce_count < 2:
-            bounce_count += 1
-            if predicted_x < left_wall:
-                predicted_x = left_wall + (left_wall - predicted_x)
-                vx = -vx * 0.9  # Some energy loss
-            elif predicted_x > right_wall:
-                predicted_x = right_wall - (predicted_x - right_wall)
-                vx = -vx * 0.9
-        
-        # Clamp to valid range
-        predicted_x = max(left_wall + 5, min(right_wall - 5, predicted_x))
-        
-        # Add anticipation based on ball direction
-        if abs(vx) > 1:
-            anticipation = min(6, abs(vx) * 1.5) * (1 if vx > 0 else -1)
-            predicted_x += anticipation * 0.4
-            
-        return predicted_x
-
-    def _predict_from_last_known(self):
-        """Predict ball position from last known state."""
-        if self._last_ball_pos is None:
-            return None
-            
-        last_x, last_y, last_step = self._last_ball_pos
-        frames_elapsed = self._steps - last_step
-        
-        vx, vy = self._consistent_velocity
-        estimated_x = last_x + vx * frames_elapsed
-        estimated_y = last_y + vy * frames_elapsed
-        
-        if estimated_y > 200:  # Ball likely lost
-            return None
-            
-        return self._calculate_target_position(estimated_x, estimated_y, self._last_paddle_x)
-
-    def _move_towards_target(self, paddle_x, target_x, urgent=False):
-        """Move paddle towards target position."""
-        distance = target_x - paddle_x
-        
-        # Dynamic threshold based on urgency
-        if urgent:
-            threshold = 1.0
-        else:
-            threshold = 2.0
-        
-        if abs(distance) > threshold:
-            if distance > 0:
-                return self.right
-            else:
-                return self.left
-        else:
-            # Fine adjustment
-            if abs(distance) > 0.5:
-                return self.right if distance > 0 else self.left
-            else:
-                return self.noop
-
-    def _find_paddle_x(self, obs):
-        """Find paddle x-center with improved robustness."""
-        # Look in multiple rows for paddle
-        for row_start in [189, 188, 190]:
-            if row_start + 3 < obs.shape[0]:
-                paddle_region = obs[row_start:row_start+3, :, :]
-                brightness = np.max(paddle_region, axis=2)
-                bright_pixels = brightness > 140
-                coords = np.argwhere(bright_pixels)
-                
-                if len(coords) > 5:  # Paddle should have multiple pixels
-                    return float(np.mean(coords[:, 1]))
-        
-        # Fallback to last known position
-        return self._last_paddle_x
-
-
-# ---------------------------------------------------------------------------
-# Train function (optional — for strategies that need training time)
-# ---------------------------------------------------------------------------
+        state = self._get_state(obs)
+        if policy_net is None:
+            return self.action_space.sample()
+        with torch.no_grad():
+            return policy_net(torch.from_numpy(state).unsqueeze(0).to(DEVICE)).argmax(1).item()
 
 def train():
-    """
-    Optional training phase, runs within TIME_BUDGET seconds.
-
-    Use this if your agent needs to learn (e.g., evolve weights,
-    tune parameters via trial runs, etc.). The evaluation happens
-    AFTER this function returns.
-
-    For pure heuristic agents, this can be a no-op.
-    """
-    print(f"Training budget: {TIME_BUDGET}s")
-    print("Current agent is heuristic-only, no training needed.")
-    print("(Modify this function to add learning: evolutionary search, "
-          "policy gradients, parameter tuning, etc.)")
-
-
-# ---------------------------------------------------------------------------
-# Main — run training + evaluation (equivalent to train.py)
-# ---------------------------------------------------------------------------
+    global policy_net, target_net
+    print("Training DQN for up to " + str(TIME_BUDGET) + "s on " + str(DEVICE) + "...")
+    env = make_env()
+    num_actions = env.action_space.n
+    policy_net = DQN(num_actions).to(DEVICE)
+    target_net = DQN(num_actions).to(DEVICE)
+    target_net.load_state_dict(policy_net.state_dict())
+    target_net.eval()
+    optimizer = optim.Adam(policy_net.parameters(), lr=LR)
+    replay = ReplayBuffer(REPLAY_CAPACITY)
+    obs, info = env.reset()
+    fstack = deque(maxlen=4)
+    fr = preprocess(obs)
+    for _ in range(4): fstack.append(fr)
+    total_steps = 0; ep_count = 0; ep_reward = 0.0; tot_reward = 0.0
+    losses = []; epsilon = EPSILON_START; t0 = time.time()
+    while True:
+        elapsed = time.time() - t0
+        if elapsed >= TIME_BUDGET: break
+        epsilon = max(EPSILON_END, EPSILON_START - total_steps / EPSILON_DECAY_STEPS)
+        state = np.array(fstack, dtype=np.float32)
+        if random.random() < epsilon:
+            action = env.action_space.sample()
+        else:
+            with torch.no_grad():
+                action = policy_net(torch.from_numpy(state).unsqueeze(0).to(DEVICE)).argmax(1).item()
+        next_obs, reward, term, trunc, info = env.step(action)
+        done = term or trunc
+        nf = preprocess(next_obs); fstack.append(nf)
+        next_state = np.array(fstack, dtype=np.float32)
+        replay.push(state, action, reward, next_state, done)
+        ep_reward += reward; total_steps += 1
+        if done:
+            obs, info = env.reset(); fr = preprocess(obs); fstack.clear()
+            for _ in range(4): fstack.append(fr)
+            tot_reward += ep_reward; ep_count += 1; ep_reward = 0.0
+        else:
+            obs = next_obs
+        if len(replay) >= REPLAY_MIN_SIZE:
+            sb, ab, rb, nsb, db = replay.sample(BATCH_SIZE)
+            st = torch.from_numpy(sb).to(DEVICE)
+            at = torch.from_numpy(ab).long().to(DEVICE)
+            rt = torch.from_numpy(rb).to(DEVICE)
+            nst = torch.from_numpy(nsb).to(DEVICE)
+            dt = torch.from_numpy(db).to(DEVICE)
+            qv = policy_net(st).gather(1, at.unsqueeze(1)).squeeze(1)
+            with torch.no_grad():
+                tgt = rt + GAMMA * target_net(nst).max(1)[0] * (1 - dt)
+            loss = nn.functional.smooth_l1_loss(qv, tgt)
+            optimizer.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(policy_net.parameters(), 10.0)
+            optimizer.step(); losses.append(loss.item())
+        if total_steps % TARGET_UPDATE_FREQ == 0:
+            target_net.load_state_dict(policy_net.state_dict())
+        if total_steps % 5000 == 0:
+            al = np.mean(losses[-100:]) if losses else 0.0
+            ar = tot_reward / max(ep_count, 1)
+            print("  step=" + str(total_steps) + " | eps=" + str(round(epsilon, 3)) + " | loss=" + str(round(al, 4)) + " | episodes=" + str(ep_count) + " | avg_reward=" + str(round(ar, 2)) + " | time=" + str(int(elapsed)) + "s/" + str(TIME_BUDGET) + "s")
+    env.close()
+    tt = time.time() - t0; ar = tot_reward / max(ep_count, 1)
+    print("Training complete: steps=" + str(total_steps) + " episodes=" + str(ep_count) + " avg_reward=" + str(round(ar, 2)) + " epsilon=" + str(round(epsilon, 3)) + " time=" + str(round(tt, 1)) + "s")
 
 if __name__ == "__main__":
     t0 = time.time()
-
-    # Phase 1: Training (within time budget)
-    print("=" * 50)
-    print("PHASE 1: Training")
-    print("=" * 50)
+    print("=" * 50); print("PHASE 1: Training"); print("=" * 50)
     train()
     train_time = time.time() - t0
-    print(f"Training time: {train_time:.1f}s")
-    print()
-
-    # Phase 2: Fixed evaluation
-    print("=" * 50)
-    print("PHASE 2: Evaluation")
-    print("=" * 50)
-    env = make_env()
-    agent = Agent(env.action_space)
-    env.close()
-
+    print("Training time: " + str(round(train_time, 1)) + "s"); print()
+    print("=" * 50); print("PHASE 2: Evaluation"); print("=" * 50)
+    env = make_env(); agent = Agent(env.action_space); env.close()
     results = evaluate_agent(agent)
     eval_time = time.time() - t0 - train_time
     total_time = time.time() - t0
-
-    # Print results in parseable format (matches autoresearch convention)
-    print()
-    print("---")
-    print(f"mean_reward:      {results['mean_reward']:.4f}")
-    print(f"std_reward:       {results['std_reward']:.4f}")
-    print(f"min_reward:       {results['min_reward']:.4f}")
-    print(f"max_reward:       {results['max_reward']:.4f}")
-    print(f"mean_steps:       {results['mean_steps']:.1f}")
-    print(f"total_steps:      {results['total_steps']}")
-    print(f"episodes:         {results['episodes']}")
-    print(f"training_seconds: {train_time:.1f}")
-    print(f"eval_seconds:     {eval_time:.1f}")
-    print(f"total_seconds:    {total_time:.1f}")
+    print(); print("---")
+    for k in ["mean_reward", "std_reward", "min_reward", "max_reward"]:
+        print(k + ":" + " " * (18 - len(k)) + str(round(results[k], 4)))
+    print("mean_steps:       " + str(round(results["mean_steps"], 1)))
+    print("total_steps:      " + str(results["total_steps"]))
+    print("episodes:         " + str(results["episodes"]))
+    print("training_seconds: " + str(round(train_time, 1)))
+    print("eval_seconds:     " + str(round(eval_time, 1)))
+    print("total_seconds:    " + str(round(total_time, 1)))

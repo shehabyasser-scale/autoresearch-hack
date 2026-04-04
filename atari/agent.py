@@ -17,7 +17,7 @@ from prepare import GAME, TIME_BUDGET, make_env, evaluate_agent
 # ---------------------------------------------------------------------------
 
 class Agent:
-    # Ball state-aware agent with simplified but more reliable prediction and improved emergency handling
+    # Simplified precise positioning with optimal paddle placement strategy
     """
     Atari Breakout agent.
 
@@ -45,14 +45,13 @@ class Agent:
         self._paddle_x = 80.0
         self._ball_lost_count = 0
         self._last_action = self.noop
-        self._ball_state = 'unknown'  # 'approaching', 'receding', 'unknown'
-        self._stable_velocity = None
-        self._velocity_confidence = 0
+        self._ball_velocity = None
+        self._velocity_samples = []
         self._last_fire_time = 0
 
     def act(self, obs):
         """
-        Ball state-aware tracking with simplified prediction.
+        Simplified precise positioning strategy.
         """
         self._steps += 1
 
@@ -69,15 +68,15 @@ class Agent:
         if ball_pos is None:
             self._ball_lost_count += 1
             
-            # More aggressive re-firing if ball lost for too long
-            if self._ball_lost_count > 20 or (self._ball_lost_count > 10 and self._steps - self._last_fire_time > 50):
+            # Re-fire if ball lost for too long
+            if self._ball_lost_count > 25 or (self._ball_lost_count > 12 and self._steps - self._last_fire_time > 60):
                 self._last_fire_time = self._steps
-                self._fired = False  # Reset fired state
+                self._fired = False
                 return self.fire
                 
-            # Smart centering when ball is lost
+            # Center paddle when ball is lost
             center_target = 80
-            if abs(self._paddle_x - center_target) > 3:
+            if abs(self._paddle_x - center_target) > 2:
                 return self.right if self._paddle_x < center_target else self.left
             else:
                 return self.noop
@@ -85,16 +84,14 @@ class Agent:
             ball_x, ball_y = ball_pos
             self._ball_lost_count = 0
 
-        # Update ball tracking and determine state
-        self._update_ball_state(ball_x, ball_y)
+        # Update ball tracking
+        self._update_ball_tracking(ball_x, ball_y)
         
-        # Calculate target position based on ball state
-        target_x = self._calculate_smart_target(ball_x, ball_y)
+        # Calculate optimal target position
+        target_x = self._calculate_optimal_target(ball_x, ball_y)
         
-        # Move paddle with state-aware logic
-        action = self._move_paddle_smart(target_x, ball_y, ball_x)
-        self._last_action = action
-        return action
+        # Move paddle with precision
+        return self._move_paddle_precise(target_x, ball_y)
 
     def _find_ball_robust(self, obs):
         """Robust ball detection with multiple fallback methods."""
@@ -131,140 +128,102 @@ class Agent:
             
         return (x_center, y_center)
 
-    def _update_ball_state(self, ball_x, ball_y):
-        """Update ball position history and determine movement state."""
+    def _update_ball_tracking(self, ball_x, ball_y):
+        """Update ball position history and calculate velocity."""
         self._ball_history.append((ball_x, ball_y, self._steps))
         
         # Keep reasonable history
-        if len(self._ball_history) > 8:
+        if len(self._ball_history) > 6:
             self._ball_history.pop(0)
             
-        # Determine ball state with improved logic
-        if len(self._ball_history) >= 4:
-            recent_positions = self._ball_history[-4:]
+        # Calculate velocity from recent positions
+        if len(self._ball_history) >= 3:
+            recent = self._ball_history[-3:]
             
-            # Calculate y-direction movement
-            y_changes = []
-            for i in range(1, len(recent_positions)):
-                y_changes.append(recent_positions[i][1] - recent_positions[i-1][1])
-            
-            avg_y_change = np.mean(y_changes) if y_changes else 0
-            
-            # Determine state based on consistent y movement
-            if avg_y_change > 0.5:
-                self._ball_state = 'approaching'
-            elif avg_y_change < -0.5:
-                self._ball_state = 'receding'
-            else:
-                self._ball_state = 'unknown'
+            # Calculate velocity over the span
+            time_span = recent[-1][2] - recent[0][2]
+            if time_span > 0:
+                vx = (recent[-1][0] - recent[0][0]) / time_span
+                vy = (recent[-1][1] - recent[0][1]) / time_span
                 
-            # Calculate stable velocity for approaching balls
-            if self._ball_state == 'approaching' and len(self._ball_history) >= 3:
-                recent = self._ball_history[-3:]
-                time_span = recent[-1][2] - recent[0][2]
-                if time_span > 0:
-                    vx = (recent[-1][0] - recent[0][0]) / time_span
-                    vy = (recent[-1][1] - recent[0][1]) / time_span
+                # Store velocity sample if reasonable
+                if abs(vx) < 6 and abs(vy) < 6:
+                    self._velocity_samples.append((vx, vy))
                     
-                    # Only update if velocity seems reasonable
-                    if abs(vx) < 5 and 0.3 < vy < 5:
-                        if self._stable_velocity is None:
-                            self._stable_velocity = (vx, vy)
-                            self._velocity_confidence = 1
-                        else:
-                            # Smooth velocity updates
-                            old_vx, old_vy = self._stable_velocity
-                            alpha = 0.3
-                            new_vx = alpha * vx + (1 - alpha) * old_vx
-                            new_vy = alpha * vy + (1 - alpha) * old_vy
-                            self._stable_velocity = (new_vx, new_vy)
-                            self._velocity_confidence = min(5, self._velocity_confidence + 1)
-            else:
-                # Decay confidence when ball is not approaching
-                if self._velocity_confidence > 0:
-                    self._velocity_confidence -= 1
-                if self._velocity_confidence <= 0:
-                    self._stable_velocity = None
+                    # Keep only recent samples
+                    if len(self._velocity_samples) > 5:
+                        self._velocity_samples.pop(0)
+                    
+                    # Calculate stable velocity from samples
+                    if len(self._velocity_samples) >= 2:
+                        vx_vals = [v[0] for v in self._velocity_samples]
+                        vy_vals = [v[1] for v in self._velocity_samples]
+                        self._ball_velocity = (np.mean(vx_vals), np.mean(vy_vals))
 
-    def _calculate_smart_target(self, ball_x, ball_y):
-        """Calculate target position based on ball state."""
-        # For high balls or receding balls, just track
-        if ball_y < 120 or self._ball_state == 'receding':
+    def _calculate_optimal_target(self, ball_x, ball_y):
+        """Calculate optimal paddle target position."""
+        # For balls high up or moving away, just track
+        if ball_y < 130:
             return ball_x
             
-        # For approaching balls, use prediction if available
-        if (self._ball_state == 'approaching' and 
-            self._stable_velocity is not None and 
-            self._velocity_confidence >= 2):
+        # Check if ball is moving toward paddle
+        if self._ball_velocity is not None:
+            vx, vy = self._ball_velocity
             
-            vx, vy = self._stable_velocity
-            
-            # Only predict if ball is moving down reasonably fast
-            if vy > 0.5:
+            # Only predict if ball is moving downward
+            if vy > 0.3:
                 # Time to reach paddle level
                 paddle_y = 189
                 time_to_paddle = (paddle_y - ball_y) / vy
                 
-                # Predict x position
+                # Predict impact position
                 predicted_x = ball_x + vx * time_to_paddle
                 
-                # Handle wall bounces (simplified)
+                # Handle wall bounces with improved accuracy
                 left_wall, right_wall = 6, 154
+                
+                # Simple bounce simulation
                 if predicted_x < left_wall:
                     predicted_x = left_wall + (left_wall - predicted_x)
                 elif predicted_x > right_wall:
                     predicted_x = right_wall - (predicted_x - right_wall)
                 
-                # Add smart positioning offset based on velocity
-                if abs(vx) > 1.0:
-                    # For fast horizontal movement, position slightly ahead
-                    offset = min(8, abs(vx) * 2) * (1 if vx > 0 else -1)
-                    predicted_x += offset * 0.5
+                # Optimal paddle positioning strategy
+                # Position paddle center slightly ahead of predicted impact for better control
+                if abs(vx) > 0.5:
+                    # For moving balls, position to hit with optimal part of paddle
+                    optimal_offset = min(6, abs(vx) * 1.5) * (1 if vx > 0 else -1)
+                    predicted_x += optimal_offset * 0.3
                 
-                # Ensure target is within paddle reach
-                predicted_x = max(15, min(145, predicted_x))
+                # Ensure target is reachable
+                predicted_x = max(12, min(148, predicted_x))
                 return predicted_x
         
-        # Fallback: track ball directly with slight anticipation
+        # Fallback: track ball with minimal anticipation
         if len(self._ball_history) >= 2:
             last_x = self._ball_history[-2][0]
             movement = ball_x - last_x
-            # Small anticipation for direct tracking
-            return ball_x + movement * 0.5
+            return ball_x + movement * 0.3
         
         return ball_x
 
-    def _move_paddle_smart(self, target_x, ball_y, ball_x):
-        """Smart paddle movement with state awareness."""
+    def _move_paddle_precise(self, target_x, ball_y):
+        """Precise paddle movement with distance-based thresholds."""
         distance = target_x - self._paddle_x
         
-        # Calculate urgency based on multiple factors
-        y_urgency = 0
-        if ball_y > 130:
-            y_urgency = (ball_y - 130) / 55  # 0 to 1
-            
-        state_urgency = 0
-        if self._ball_state == 'approaching':
-            state_urgency = 0.4
-            
-        # Add urgency if we're moving away from the ball
-        direction_urgency = 0
-        if self._last_action in [self.left, self.right]:
-            if (self._last_action == self.left and ball_x > self._paddle_x) or \
-               (self._last_action == self.right and ball_x < self._paddle_x):
-                direction_urgency = 0.3
+        # Calculate movement urgency based on ball height
+        if ball_y > 160:
+            # Ball is close - be more aggressive
+            move_threshold = 1.5
+        elif ball_y > 140:
+            # Ball is approaching - moderate urgency
+            move_threshold = 3.0
+        else:
+            # Ball is far - be more selective
+            move_threshold = 4.5
         
-        total_urgency = min(1.0, y_urgency + state_urgency + direction_urgency)
-        
-        # Adaptive movement thresholds
-        move_threshold = 5.0 - 4.0 * total_urgency  # 5.0 when calm, 1.0 when urgent
-        fine_threshold = move_threshold * 0.4
-        
-        # Movement decision
+        # Move if beyond threshold
         if abs(distance) > move_threshold:
-            return self.right if distance > 0 else self.left
-        elif abs(distance) > fine_threshold and total_urgency > 0.3:
-            # Fine movement when somewhat urgent
             return self.right if distance > 0 else self.left
         else:
             return self.noop

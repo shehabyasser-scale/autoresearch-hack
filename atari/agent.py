@@ -17,7 +17,7 @@ from prepare import GAME, TIME_BUDGET, make_env, evaluate_agent
 # ---------------------------------------------------------------------------
 
 class Agent:
-    # Simplified precise positioning with optimal paddle placement strategy
+    # Enhanced paddle movement with adaptive speed and improved ball interception
     """
     Atari Breakout agent.
 
@@ -48,10 +48,12 @@ class Agent:
         self._ball_velocity = None
         self._velocity_samples = []
         self._last_fire_time = 0
+        self._consecutive_moves = 0
+        self._last_move_direction = None
 
     def act(self, obs):
         """
-        Simplified precise positioning strategy.
+        Enhanced positioning strategy with adaptive paddle movement.
         """
         self._steps += 1
 
@@ -90,8 +92,8 @@ class Agent:
         # Calculate optimal target position
         target_x = self._calculate_optimal_target(ball_x, ball_y)
         
-        # Move paddle with precision
-        return self._move_paddle_precise(target_x, ball_y)
+        # Move paddle with enhanced precision and speed
+        return self._move_paddle_enhanced(target_x, ball_y)
 
     def _find_ball_robust(self, obs):
         """Robust ball detection with multiple fallback methods."""
@@ -161,9 +163,13 @@ class Agent:
                         self._ball_velocity = (np.mean(vx_vals), np.mean(vy_vals))
 
     def _calculate_optimal_target(self, ball_x, ball_y):
-        """Calculate optimal paddle target position."""
-        # For balls high up or moving away, just track
+        """Calculate optimal paddle target position with improved prediction."""
+        # For balls high up or moving away, just track with slight anticipation
         if ball_y < 130:
+            if len(self._ball_history) >= 2:
+                last_x = self._ball_history[-2][0]
+                movement = ball_x - last_x
+                return ball_x + movement * 0.5
             return ball_x
             
         # Check if ball is moving toward paddle
@@ -171,10 +177,10 @@ class Agent:
             vx, vy = self._ball_velocity
             
             # Only predict if ball is moving downward
-            if vy > 0.3:
-                # Time to reach paddle level
+            if vy > 0.2:
+                # Time to reach paddle level with better accuracy
                 paddle_y = 189
-                time_to_paddle = (paddle_y - ball_y) / vy
+                time_to_paddle = max(1, (paddle_y - ball_y) / vy)
                 
                 # Predict impact position
                 predicted_x = ball_x + vx * time_to_paddle
@@ -182,50 +188,91 @@ class Agent:
                 # Handle wall bounces with improved accuracy
                 left_wall, right_wall = 6, 154
                 
-                # Simple bounce simulation
-                if predicted_x < left_wall:
-                    predicted_x = left_wall + (left_wall - predicted_x)
-                elif predicted_x > right_wall:
-                    predicted_x = right_wall - (predicted_x - right_wall)
+                # Improved bounce simulation
+                while predicted_x < left_wall or predicted_x > right_wall:
+                    if predicted_x < left_wall:
+                        predicted_x = left_wall + (left_wall - predicted_x)
+                    elif predicted_x > right_wall:
+                        predicted_x = right_wall - (predicted_x - right_wall)
                 
-                # Optimal paddle positioning strategy
-                # Position paddle center slightly ahead of predicted impact for better control
-                if abs(vx) > 0.5:
-                    # For moving balls, position to hit with optimal part of paddle
-                    optimal_offset = min(6, abs(vx) * 1.5) * (1 if vx > 0 else -1)
-                    predicted_x += optimal_offset * 0.3
+                # Enhanced paddle positioning strategy
+                # Position paddle for optimal ball control
+                if abs(vx) > 0.3:
+                    # For fast moving balls, position to hit with paddle edge for better angle control
+                    if ball_y > 170:  # Very close to paddle
+                        control_offset = min(8, abs(vx) * 2.0) * (1 if vx > 0 else -1)
+                        predicted_x += control_offset * 0.4
+                    else:
+                        # Standard positioning with slight lead
+                        control_offset = min(6, abs(vx) * 1.5) * (1 if vx > 0 else -1)
+                        predicted_x += control_offset * 0.3
                 
                 # Ensure target is reachable
                 predicted_x = max(12, min(148, predicted_x))
                 return predicted_x
         
-        # Fallback: track ball with minimal anticipation
+        # Fallback: track ball with enhanced anticipation
         if len(self._ball_history) >= 2:
             last_x = self._ball_history[-2][0]
             movement = ball_x - last_x
-            return ball_x + movement * 0.3
+            # Increase anticipation based on ball proximity
+            anticipation = 0.5 if ball_y > 160 else 0.3
+            return ball_x + movement * anticipation
         
         return ball_x
 
-    def _move_paddle_precise(self, target_x, ball_y):
-        """Precise paddle movement with distance-based thresholds."""
+    def _move_paddle_enhanced(self, target_x, ball_y):
+        """Enhanced paddle movement with adaptive speed and momentum."""
         distance = target_x - self._paddle_x
         
-        # Calculate movement urgency based on ball height
-        if ball_y > 160:
-            # Ball is close - be more aggressive
+        # Calculate urgency and required precision based on ball position
+        if ball_y > 175:
+            # Ball is very close - maximum urgency, tight control
+            move_threshold = 0.8
+            precision_mode = True
+        elif ball_y > 160:
+            # Ball is close - high urgency
             move_threshold = 1.5
+            precision_mode = True
         elif ball_y > 140:
             # Ball is approaching - moderate urgency
-            move_threshold = 3.0
+            move_threshold = 2.5
+            precision_mode = False
         else:
-            # Ball is far - be more selective
-            move_threshold = 4.5
+            # Ball is far - be selective
+            move_threshold = 4.0
+            precision_mode = False
         
-        # Move if beyond threshold
+        # Enhanced movement logic
         if abs(distance) > move_threshold:
-            return self.right if distance > 0 else self.left
+            direction = self.right if distance > 0 else self.left
+            
+            # Track consecutive moves for momentum
+            if direction == self._last_move_direction:
+                self._consecutive_moves += 1
+            else:
+                self._consecutive_moves = 1
+                self._last_move_direction = direction
+            
+            # In precision mode with large distances, allow faster movement
+            if precision_mode and abs(distance) > 8:
+                # Continue moving aggressively when far from target in critical situations
+                return direction
+            elif precision_mode and abs(distance) > 3:
+                # Moderate movement when getting closer
+                return direction
+            elif not precision_mode or abs(distance) > move_threshold:
+                # Normal movement
+                return direction
+            else:
+                # Fine positioning - occasionally skip moves for precision
+                if self._consecutive_moves % 3 == 0 and abs(distance) < 2:
+                    return self.noop
+                return direction
         else:
+            # Reset movement tracking when stopped
+            self._consecutive_moves = 0
+            self._last_move_direction = None
             return self.noop
 
     def _find_paddle_x(self, obs):

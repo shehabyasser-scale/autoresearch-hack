@@ -17,7 +17,7 @@ from prepare import GAME, TIME_BUDGET, make_env, evaluate_agent
 # ---------------------------------------------------------------------------
 
 class Agent:
-    # Enhanced anticipatory positioning with velocity-aware momentum and improved edge case handling
+    # Robust multi-method ball detection with simplified but more reliable positioning strategy
     """
     Atari Breakout agent.
 
@@ -44,19 +44,18 @@ class Agent:
         self._ball_positions = []
         self._no_ball_count = 0
         self._last_paddle_x = 80.0
-        self._trajectory_confidence = 0.0
         self._last_action = self.noop
-        self._action_momentum = 0
         self._ball_lost_frames = 0
         self._ball_velocity = (0, 0)
-        self._velocity_history = []
-        self._anticipation_offset = 0
+        self._last_ball_pos = None
+        self._consistent_velocity = (0, 0)
+        self._velocity_confidence = 0.0
 
     def act(self, obs):
         """
         Given a (210, 160, 3) uint8 RGB observation, return an action.
         
-        Enhanced strategy with anticipatory positioning and velocity-aware movement.
+        Robust strategy with multi-method ball detection and reliable positioning.
         """
         self._steps += 1
 
@@ -65,245 +64,243 @@ class Agent:
             self._fired = True
             return self.fire
 
-        # Find ball and paddle positions
-        ball_pos = self._find_ball_robust(obs)
+        # Find ball and paddle positions using multiple methods
+        ball_pos = self._find_ball_multi_method(obs)
         paddle_x = self._find_paddle_x(obs)
         self._last_paddle_x = paddle_x
 
         if ball_pos is None:
             self._no_ball_count += 1
             self._ball_lost_frames += 1
-            self._trajectory_confidence = max(0, self._trajectory_confidence - 0.3)
+            self._velocity_confidence *= 0.8
             
             # Emergency ball recovery
-            if self._ball_lost_frames > 12:
+            if self._ball_lost_frames > 15:
                 return self.fire
             
-            # Use velocity-based prediction if available
-            if len(self._velocity_history) >= 2 and self._trajectory_confidence > 0.2:
-                predicted_x = self._predict_with_velocity()
+            # Use last known trajectory if confident
+            if self._velocity_confidence > 0.5 and self._last_ball_pos is not None:
+                predicted_x = self._predict_from_last_known()
                 if predicted_x is not None:
-                    return self._move_towards_target_enhanced(paddle_x, predicted_x, urgent=True)
+                    return self._move_towards_target(paddle_x, predicted_x, urgent=True)
             
-            # Anticipatory positioning when ball is lost
-            center_x = 80 + self._anticipation_offset
-            return self._move_towards_target_enhanced(paddle_x, center_x, urgent=False)
+            # Default positioning when ball is lost
+            center_x = 80
+            return self._move_towards_target(paddle_x, center_x, urgent=False)
         else:
             ball_x, ball_y = ball_pos
             self._no_ball_count = 0
             self._ball_lost_frames = 0
-            self._trajectory_confidence = min(1.0, self._trajectory_confidence + 0.4)
 
-        # Update ball position and velocity history
+        # Update ball tracking
         self._update_ball_tracking(ball_x, ball_y)
 
-        # Calculate target position with anticipatory offset
-        target_x = self._calculate_enhanced_target_position(ball_x, ball_y)
+        # Calculate target position
+        target_x = self._calculate_target_position(ball_x, ball_y, paddle_x)
         
-        # Determine urgency and anticipation based on ball state
-        urgent = ball_y > 65 or (abs(self._ball_velocity[1]) > 3)
+        # Determine urgency based on ball position and velocity
+        urgent = ball_y > 70 or abs(self._consistent_velocity[1]) > 2.5
         
-        return self._move_towards_target_enhanced(paddle_x, target_x, urgent)
+        return self._move_towards_target(paddle_x, target_x, urgent)
+
+    def _find_ball_multi_method(self, obs):
+        """Multi-method ball detection for robustness."""
+        # Method 1: Standard bright pixel detection
+        ball_pos = self._find_ball_method1(obs)
+        if ball_pos is not None:
+            return ball_pos
+            
+        # Method 2: Color-based detection
+        ball_pos = self._find_ball_method2(obs)
+        if ball_pos is not None:
+            return ball_pos
+            
+        # Method 3: Edge-based detection
+        ball_pos = self._find_ball_method3(obs)
+        return ball_pos
+
+    def _find_ball_method1(self, obs):
+        """Standard bright pixel detection."""
+        field = obs[95:180, 8:152, :]
+        brightness = np.max(field, axis=2)
+        bright_pixels = brightness > 180
+        coords = np.argwhere(bright_pixels)
+        
+        if len(coords) == 0 or len(coords) > 20:
+            return None
+            
+        y_center = float(np.mean(coords[:, 0])) + 95
+        x_center = float(np.mean(coords[:, 1])) + 8
+        return (x_center, y_center)
+
+    def _find_ball_method2(self, obs):
+        """Color-based detection looking for white/bright objects."""
+        field = obs[95:180, 8:152, :]
+        r, g, b = field[:, :, 0], field[:, :, 1], field[:, :, 2]
+        
+        # Look for white-ish pixels
+        white_mask = (r > 160) & (g > 160) & (b > 160)
+        # Also look for very bright pixels in any channel
+        bright_mask = (r > 200) | (g > 200) | (b > 200)
+        
+        ball_mask = white_mask | bright_mask
+        coords = np.argwhere(ball_mask)
+        
+        if len(coords) == 0 or len(coords) > 25:
+            return None
+            
+        y_center = float(np.mean(coords[:, 0])) + 95
+        x_center = float(np.mean(coords[:, 1])) + 8
+        return (x_center, y_center)
+
+    def _find_ball_method3(self, obs):
+        """Edge-based detection for small moving objects."""
+        field = obs[95:180, 8:152, :]
+        gray = np.mean(field, axis=2)
+        
+        # Simple edge detection
+        edges_y = np.abs(np.diff(gray, axis=0))
+        edges_x = np.abs(np.diff(gray, axis=1))
+        
+        # Pad to maintain shape
+        edges_y = np.pad(edges_y, ((0, 1), (0, 0)), mode='constant')
+        edges_x = np.pad(edges_x, ((0, 0), (0, 1)), mode='constant')
+        
+        edge_strength = edges_y + edges_x
+        strong_edges = edge_strength > 30
+        
+        coords = np.argwhere(strong_edges)
+        
+        if len(coords) == 0 or len(coords) > 15:
+            return None
+            
+        y_center = float(np.mean(coords[:, 0])) + 95
+        x_center = float(np.mean(coords[:, 1])) + 8
+        return (x_center, y_center)
 
     def _update_ball_tracking(self, ball_x, ball_y):
         """Update ball position and velocity tracking."""
-        self._ball_positions.append((ball_x, ball_y, self._steps))
-        if len(self._ball_positions) > 6:
+        current_pos = (ball_x, ball_y, self._steps)
+        self._ball_positions.append(current_pos)
+        if len(self._ball_positions) > 5:
             self._ball_positions.pop(0)
 
-        # Calculate current velocity
+        # Calculate velocity with smoothing
         if len(self._ball_positions) >= 2:
             prev_pos = self._ball_positions[-2]
-            curr_pos = self._ball_positions[-1]
-            dt = max(1, curr_pos[2] - prev_pos[2])
-            vx = (curr_pos[0] - prev_pos[0]) / dt
-            vy = (curr_pos[1] - prev_pos[1]) / dt
+            dt = max(1, current_pos[2] - prev_pos[2])
+            vx = (current_pos[0] - prev_pos[0]) / dt
+            vy = (current_pos[1] - prev_pos[1]) / dt
             self._ball_velocity = (vx, vy)
             
-            # Track velocity history for stability
-            self._velocity_history.append(self._ball_velocity)
-            if len(self._velocity_history) > 4:
-                self._velocity_history.pop(0)
+            # Update consistent velocity with exponential smoothing
+            alpha = 0.3
+            self._consistent_velocity = (
+                alpha * vx + (1 - alpha) * self._consistent_velocity[0],
+                alpha * vy + (1 - alpha) * self._consistent_velocity[1]
+            )
+            
+            # Update velocity confidence
+            if len(self._ball_positions) >= 3:
+                self._velocity_confidence = min(1.0, self._velocity_confidence + 0.2)
+            
+        self._last_ball_pos = current_pos
 
-    def _calculate_enhanced_target_position(self, ball_x, ball_y):
-        """Calculate target position with enhanced anticipation."""
+    def _calculate_target_position(self, ball_x, ball_y, paddle_x):
+        """Calculate optimal target position."""
         if len(self._ball_positions) < 2:
             return ball_x
             
-        # Get smoothed velocity
-        if len(self._velocity_history) >= 2:
-            recent_vx = [v[0] for v in self._velocity_history[-3:]]
-            recent_vy = [v[1] for v in self._velocity_history[-3:]]
-            smooth_vx = np.mean(recent_vx)
-            smooth_vy = np.mean(recent_vy)
-        else:
-            smooth_vx, smooth_vy = self._ball_velocity
-
-        # Enhanced intercept prediction
-        predicted_x = self._predict_intercept_enhanced(ball_x, ball_y, smooth_vx, smooth_vy)
+        vx, vy = self._consistent_velocity
         
-        # Add anticipatory offset based on ball velocity direction
-        if abs(smooth_vx) > 1.0:
-            anticipation_factor = min(8.0, abs(smooth_vx) * 2.0)
-            if smooth_vx > 0:  # Ball moving right
-                self._anticipation_offset = anticipation_factor
-            else:  # Ball moving left
-                self._anticipation_offset = -anticipation_factor
-        else:
-            self._anticipation_offset *= 0.8  # Decay offset
-        
-        return predicted_x + self._anticipation_offset * 0.3
-
-    def _predict_intercept_enhanced(self, ball_x, ball_y, vx, vy):
-        """Enhanced physics-based intercept prediction."""
+        # Simple intercept calculation
         paddle_y = 189
-        
         if ball_y >= paddle_y or abs(vy) < 0.1:
             return ball_x
             
-        # Calculate time to intercept
-        frames_to_paddle = (paddle_y - ball_y) / max(0.5, abs(vy))
+        # Time to intercept
+        time_to_intercept = (paddle_y - ball_y) / max(0.5, abs(vy))
         
-        # Project position with wall bounces
-        predicted_x = ball_x + vx * frames_to_paddle
-        predicted_vx = vx
+        # Predicted position with wall bounces
+        predicted_x = ball_x + vx * time_to_intercept
         
-        # Simulate wall bounces with energy conservation
-        bounce_count = 0
+        # Handle wall bounces
         left_wall, right_wall = 8, 152
+        bounce_count = 0
         
-        while (predicted_x < left_wall or predicted_x > right_wall) and bounce_count < 3:
+        while (predicted_x < left_wall or predicted_x > right_wall) and bounce_count < 2:
             bounce_count += 1
-            energy_loss = 0.95 - bounce_count * 0.05  # Gradual energy loss
-            
             if predicted_x < left_wall:
-                overshoot = left_wall - predicted_x
-                predicted_x = left_wall + overshoot * energy_loss
-                predicted_vx = -predicted_vx * energy_loss
+                predicted_x = left_wall + (left_wall - predicted_x)
+                vx = -vx * 0.9  # Some energy loss
             elif predicted_x > right_wall:
-                overshoot = predicted_x - right_wall
-                predicted_x = right_wall - overshoot * energy_loss
-                predicted_vx = -predicted_vx * energy_loss
+                predicted_x = right_wall - (predicted_x - right_wall)
+                vx = -vx * 0.9
         
-        return max(left_wall, min(right_wall, predicted_x))
+        # Clamp to valid range
+        predicted_x = max(left_wall + 5, min(right_wall - 5, predicted_x))
+        
+        # Add anticipation based on ball direction
+        if abs(vx) > 1:
+            anticipation = min(6, abs(vx) * 1.5) * (1 if vx > 0 else -1)
+            predicted_x += anticipation * 0.4
+            
+        return predicted_x
 
-    def _predict_with_velocity(self):
-        """Predict ball position using velocity history when ball is lost."""
-        if not self._velocity_history:
+    def _predict_from_last_known(self):
+        """Predict ball position from last known state."""
+        if self._last_ball_pos is None:
             return None
             
-        # Use last known position and velocity
-        if self._ball_positions:
-            last_pos = self._ball_positions[-1]
-            last_vx, last_vy = self._velocity_history[-1]
+        last_x, last_y, last_step = self._last_ball_pos
+        frames_elapsed = self._steps - last_step
+        
+        vx, vy = self._consistent_velocity
+        estimated_x = last_x + vx * frames_elapsed
+        estimated_y = last_y + vy * frames_elapsed
+        
+        if estimated_y > 200:  # Ball likely lost
+            return None
             
-            # Estimate current position
-            frames_elapsed = self._ball_lost_frames
-            estimated_x = last_pos[0] + last_vx * frames_elapsed
-            estimated_y = last_pos[1] + last_vy * frames_elapsed
-            
-            if estimated_y < 200:  # Ball still in play
-                return self._predict_intercept_enhanced(estimated_x, estimated_y, last_vx, last_vy)
-                
-        return None
+        return self._calculate_target_position(estimated_x, estimated_y, self._last_paddle_x)
 
-    def _move_towards_target_enhanced(self, paddle_x, target_x, urgent=False):
-        """Enhanced movement with velocity-aware momentum."""
+    def _move_towards_target(self, paddle_x, target_x, urgent=False):
+        """Move paddle towards target position."""
         distance = target_x - paddle_x
         
-        # Dynamic threshold based on ball velocity and urgency
-        base_threshold = 1.8
-        velocity_factor = min(2.0, abs(self._ball_velocity[0]) * 0.3) if self._ball_velocity[0] != 0 else 1.0
-        
+        # Dynamic threshold based on urgency
         if urgent:
-            threshold = base_threshold * 0.5 / velocity_factor
+            threshold = 1.0
         else:
-            threshold = base_threshold * (1.1 - self._trajectory_confidence * 0.3)
+            threshold = 2.0
         
-        # Enhanced momentum system
         if abs(distance) > threshold:
-            desired_direction = 1 if distance > 0 else -1
-            
-            # Adjust momentum based on urgency and ball velocity
-            if urgent and abs(self._ball_velocity[1]) > 2:
-                momentum_factor = 0.8  # More aggressive when ball is fast
-            elif urgent:
-                momentum_factor = 0.6
-            else:
-                momentum_factor = 0.4
-            
-            self._action_momentum = momentum_factor * self._action_momentum + (1 - momentum_factor) * desired_direction
-            
-            # Dynamic movement threshold
-            if urgent and abs(distance) > 5:
-                move_threshold = 0.2  # Very responsive for urgent situations
-            elif urgent:
-                move_threshold = 0.3
-            else:
-                move_threshold = 0.4
-            
-            if self._action_momentum > move_threshold:
+            if distance > 0:
                 return self.right
-            elif self._action_momentum < -move_threshold:
-                return self.left
             else:
-                return self.noop
+                return self.left
         else:
-            # Fine positioning with velocity consideration
-            self._action_momentum *= 0.7
-            if abs(distance) > 0.8:
+            # Fine adjustment
+            if abs(distance) > 0.5:
                 return self.right if distance > 0 else self.left
             else:
                 return self.noop
 
-    def _find_ball_robust(self, obs):
-        """Robust ball detection focusing on consistency."""
-        # Focus on the main game area
-        field = obs[95:180, 8:152, :]
-        
-        # Look for bright pixels (ball is typically white/bright)
-        brightness = np.max(field, axis=2)
-        bright_pixels = brightness > 180
-        
-        # Also check for high contrast pixels
-        r, g, b = field[:, :, 0], field[:, :, 1], field[:, :, 2]
-        white_like = (r > 170) & (g > 170) & (b > 170)
-        
-        # Combine criteria
-        ball_candidates = bright_pixels | white_like
-        coords = np.argwhere(ball_candidates)
-        
-        if len(coords) == 0:
-            return None
-            
-        # Filter by size - ball should be small
-        if len(coords) > 20:
-            # Try stricter criteria
-            very_bright = brightness > 200
-            strict_coords = np.argwhere(very_bright)
-            if len(strict_coords) > 0 and len(strict_coords) <= 15:
-                coords = strict_coords
-            else:
-                return None
-        
-        if len(coords) <= 15:
-            y_center = float(np.mean(coords[:, 0])) + 95  # Adjust for field offset
-            x_center = float(np.mean(coords[:, 1])) + 8   # Adjust for field offset
-            return (x_center, y_center)
-            
-        return None
-
     def _find_paddle_x(self, obs):
-        """Find paddle x-center."""
-        paddle_region = obs[189:195, :, :]
-        brightness = np.max(paddle_region, axis=2)
-        bright_pixels = brightness > 150
-        coords = np.argwhere(bright_pixels)
+        """Find paddle x-center with improved robustness."""
+        # Look in multiple rows for paddle
+        for row_start in [189, 188, 190]:
+            if row_start + 3 < obs.shape[0]:
+                paddle_region = obs[row_start:row_start+3, :, :]
+                brightness = np.max(paddle_region, axis=2)
+                bright_pixels = brightness > 140
+                coords = np.argwhere(bright_pixels)
+                
+                if len(coords) > 5:  # Paddle should have multiple pixels
+                    return float(np.mean(coords[:, 1]))
         
-        if len(coords) == 0:
-            return self._last_paddle_x
-            
-        return float(np.mean(coords[:, 1]))
+        # Fallback to last known position
+        return self._last_paddle_x
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ from prepare import GAME, TIME_BUDGET, make_env, evaluate_agent
 # ---------------------------------------------------------------------------
 
 class Agent:
-    # Enhanced paddle movement with adaptive speed and improved ball interception
+    # Improved ball detection with simplified movement logic and better edge case handling
     """
     Atari Breakout agent.
 
@@ -48,12 +48,12 @@ class Agent:
         self._ball_velocity = None
         self._velocity_samples = []
         self._last_fire_time = 0
-        self._consecutive_moves = 0
-        self._last_move_direction = None
+        self._stable_ball_pos = None
+        self._detection_confidence = 0
 
     def act(self, obs):
         """
-        Enhanced positioning strategy with adaptive paddle movement.
+        Enhanced positioning strategy with improved ball detection and simplified movement.
         """
         self._steps += 1
 
@@ -63,235 +63,222 @@ class Agent:
             self._last_fire_time = self._steps
             return self.fire
 
-        # Find ball and paddle
-        ball_pos = self._find_ball_robust(obs)
+        # Find ball and paddle with improved detection
+        ball_pos = self._find_ball_enhanced(obs)
         self._paddle_x = self._find_paddle_x(obs)
 
         if ball_pos is None:
             self._ball_lost_count += 1
+            self._detection_confidence = max(0, self._detection_confidence - 1)
             
             # Re-fire if ball lost for too long
-            if self._ball_lost_count > 25 or (self._ball_lost_count > 12 and self._steps - self._last_fire_time > 60):
+            if self._ball_lost_count > 20 or (self._ball_lost_count > 10 and self._steps - self._last_fire_time > 50):
                 self._last_fire_time = self._steps
                 self._fired = False
                 return self.fire
                 
+            # Use last known stable position if available
+            if self._stable_ball_pos is not None and self._ball_lost_count < 8:
+                ball_x, ball_y = self._stable_ball_pos
+                target_x = self._calculate_target_position(ball_x, ball_y)
+                return self._move_paddle_smooth(target_x, ball_y)
+                
             # Center paddle when ball is lost
             center_target = 80
-            if abs(self._paddle_x - center_target) > 2:
+            if abs(self._paddle_x - center_target) > 3:
                 return self.right if self._paddle_x < center_target else self.left
             else:
                 return self.noop
         else:
             ball_x, ball_y = ball_pos
             self._ball_lost_count = 0
+            self._detection_confidence = min(10, self._detection_confidence + 1)
+            
+            # Update stable position only when confident
+            if self._detection_confidence >= 3:
+                self._stable_ball_pos = (ball_x, ball_y)
 
         # Update ball tracking
         self._update_ball_tracking(ball_x, ball_y)
         
         # Calculate optimal target position
-        target_x = self._calculate_optimal_target(ball_x, ball_y)
+        target_x = self._calculate_target_position(ball_x, ball_y)
         
-        # Move paddle with enhanced precision and speed
-        return self._move_paddle_enhanced(target_x, ball_y)
+        # Move paddle with smooth movement
+        return self._move_paddle_smooth(target_x, ball_y)
 
-    def _find_ball_robust(self, obs):
-        """Robust ball detection with multiple fallback methods."""
+    def _find_ball_enhanced(self, obs):
+        """Enhanced ball detection with multiple methods and confidence scoring."""
         # Focus on main game area
         field = obs[93:187, 6:154, :]
         
-        # Method 1: Very bright pixels (primary)
+        # Method 1: Bright white pixels (most reliable)
+        white_mask = np.all(field >= [200, 200, 200], axis=2)
+        
+        # Method 2: High brightness
         brightness = np.max(field, axis=2)
-        very_bright = brightness > 200
+        bright_mask = brightness >= 180
         
-        # Method 2: Pure white detection
-        white_pixels = np.all(field >= [210, 210, 210], axis=2)
+        # Method 3: Orange-ish ball color (backup)
+        orange_mask = (field[:, :, 0] > 200) & (field[:, :, 1] > 100) & (field[:, :, 1] < 180) & (field[:, :, 2] < 100)
         
-        # Method 3: High contrast small objects
-        contrast = np.max(field, axis=2) - np.min(field, axis=2)
-        high_contrast = (contrast > 120) & (brightness > 160)
+        # Combine masks with priority
+        ball_mask = white_mask | (bright_mask & (brightness > 190)) | orange_mask
         
-        # Combine detection methods
-        ball_candidates = very_bright | white_pixels | high_contrast
+        coords = np.argwhere(ball_mask)
         
-        coords = np.argwhere(ball_candidates)
-        
-        # Filter by size - ball should be small
-        if len(coords) == 0 or len(coords) > 25:
+        # Filter by reasonable size (ball should be small cluster)
+        if len(coords) == 0 or len(coords) > 30:
             return None
+        
+        # Remove outliers for better center calculation
+        if len(coords) > 4:
+            y_coords = coords[:, 0]
+            x_coords = coords[:, 1]
             
-        # Get center position
+            # Remove extreme outliers
+            y_median = np.median(y_coords)
+            x_median = np.median(x_coords)
+            
+            distances = np.sqrt((y_coords - y_median)**2 + (x_coords - x_median)**2)
+            valid_mask = distances < np.percentile(distances, 80)
+            coords = coords[valid_mask]
+            
+            if len(coords) == 0:
+                return None
+        
+        # Calculate center
         y_center = float(np.mean(coords[:, 0])) + 93
         x_center = float(np.mean(coords[:, 1])) + 6
         
-        # Validate position
+        # Validate position is in game area
         if y_center < 93 or y_center > 187 or x_center < 6 or x_center > 154:
             return None
             
         return (x_center, y_center)
 
     def _update_ball_tracking(self, ball_x, ball_y):
-        """Update ball position history and calculate velocity."""
+        """Update ball position history and calculate stable velocity."""
         self._ball_history.append((ball_x, ball_y, self._steps))
         
         # Keep reasonable history
-        if len(self._ball_history) > 6:
+        if len(self._ball_history) > 5:
             self._ball_history.pop(0)
             
-        # Calculate velocity from recent positions
+        # Calculate velocity from stable positions
         if len(self._ball_history) >= 3:
-            recent = self._ball_history[-3:]
+            # Use first and last position for more stable velocity
+            first = self._ball_history[0]
+            last = self._ball_history[-1]
             
-            # Calculate velocity over the span
-            time_span = recent[-1][2] - recent[0][2]
+            time_span = last[2] - first[2]
             if time_span > 0:
-                vx = (recent[-1][0] - recent[0][0]) / time_span
-                vy = (recent[-1][1] - recent[0][1]) / time_span
+                vx = (last[0] - first[0]) / time_span
+                vy = (last[1] - first[1]) / time_span
                 
-                # Store velocity sample if reasonable
-                if abs(vx) < 6 and abs(vy) < 6:
+                # Store velocity if reasonable
+                if abs(vx) < 5 and abs(vy) < 5:
                     self._velocity_samples.append((vx, vy))
                     
-                    # Keep only recent samples
-                    if len(self._velocity_samples) > 5:
+                    # Keep recent samples
+                    if len(self._velocity_samples) > 4:
                         self._velocity_samples.pop(0)
                     
-                    # Calculate stable velocity from samples
+                    # Calculate stable velocity
                     if len(self._velocity_samples) >= 2:
                         vx_vals = [v[0] for v in self._velocity_samples]
                         vy_vals = [v[1] for v in self._velocity_samples]
-                        self._ball_velocity = (np.mean(vx_vals), np.mean(vy_vals))
+                        self._ball_velocity = (np.median(vx_vals), np.median(vy_vals))
 
-    def _calculate_optimal_target(self, ball_x, ball_y):
-        """Calculate optimal paddle target position with improved prediction."""
-        # For balls high up or moving away, just track with slight anticipation
-        if ball_y < 130:
-            if len(self._ball_history) >= 2:
-                last_x = self._ball_history[-2][0]
-                movement = ball_x - last_x
-                return ball_x + movement * 0.5
+    def _calculate_target_position(self, ball_x, ball_y):
+        """Calculate target position with improved prediction accuracy."""
+        # For high balls, use simple tracking
+        if ball_y < 125:
             return ball_x
             
-        # Check if ball is moving toward paddle
+        # Use velocity prediction for approaching balls
         if self._ball_velocity is not None:
             vx, vy = self._ball_velocity
             
-            # Only predict if ball is moving downward
-            if vy > 0.2:
-                # Time to reach paddle level with better accuracy
+            # Only predict if ball is moving toward paddle
+            if vy > 0.1:
+                # Calculate time to reach paddle
                 paddle_y = 189
                 time_to_paddle = max(1, (paddle_y - ball_y) / vy)
                 
                 # Predict impact position
                 predicted_x = ball_x + vx * time_to_paddle
                 
-                # Handle wall bounces with improved accuracy
+                # Handle wall bounces
                 left_wall, right_wall = 6, 154
                 
-                # Improved bounce simulation
+                # Simple bounce calculation
                 while predicted_x < left_wall or predicted_x > right_wall:
                     if predicted_x < left_wall:
                         predicted_x = left_wall + (left_wall - predicted_x)
                     elif predicted_x > right_wall:
                         predicted_x = right_wall - (predicted_x - right_wall)
                 
-                # Enhanced paddle positioning strategy
-                # Position paddle for optimal ball control
-                if abs(vx) > 0.3:
-                    # For fast moving balls, position to hit with paddle edge for better angle control
-                    if ball_y > 170:  # Very close to paddle
-                        control_offset = min(8, abs(vx) * 2.0) * (1 if vx > 0 else -1)
-                        predicted_x += control_offset * 0.4
-                    else:
-                        # Standard positioning with slight lead
-                        control_offset = min(6, abs(vx) * 1.5) * (1 if vx > 0 else -1)
-                        predicted_x += control_offset * 0.3
+                # Add strategic positioning offset based on ball speed
+                if ball_y > 165:  # Close to paddle
+                    if abs(vx) > 0.5:
+                        # Position to hit ball with slight angle for control
+                        offset = min(4, abs(vx) * 1.5) * (1 if vx > 0 else -1)
+                        predicted_x += offset * 0.3
                 
                 # Ensure target is reachable
-                predicted_x = max(12, min(148, predicted_x))
+                predicted_x = max(10, min(150, predicted_x))
                 return predicted_x
         
-        # Fallback: track ball with enhanced anticipation
+        # Fallback: simple tracking with slight anticipation
         if len(self._ball_history) >= 2:
-            last_x = self._ball_history[-2][0]
-            movement = ball_x - last_x
-            # Increase anticipation based on ball proximity
-            anticipation = 0.5 if ball_y > 160 else 0.3
+            prev_x = self._ball_history[-2][0]
+            movement = ball_x - prev_x
+            anticipation = 0.4 if ball_y > 155 else 0.2
             return ball_x + movement * anticipation
         
         return ball_x
 
-    def _move_paddle_enhanced(self, target_x, ball_y):
-        """Enhanced paddle movement with adaptive speed and momentum."""
+    def _move_paddle_smooth(self, target_x, ball_y):
+        """Smooth paddle movement with distance-based speed control."""
         distance = target_x - self._paddle_x
         
-        # Calculate urgency and required precision based on ball position
-        if ball_y > 175:
-            # Ball is very close - maximum urgency, tight control
-            move_threshold = 0.8
-            precision_mode = True
-        elif ball_y > 160:
-            # Ball is close - high urgency
-            move_threshold = 1.5
-            precision_mode = True
-        elif ball_y > 140:
-            # Ball is approaching - moderate urgency
-            move_threshold = 2.5
-            precision_mode = False
+        # Calculate urgency based on ball position
+        if ball_y > 170:
+            # Critical - ball very close
+            threshold = 1.0
+        elif ball_y > 150:
+            # Important - ball approaching
+            threshold = 2.0
+        elif ball_y > 130:
+            # Moderate - ball in mid area
+            threshold = 3.5
         else:
-            # Ball is far - be selective
-            move_threshold = 4.0
-            precision_mode = False
+            # Low priority - ball far away
+            threshold = 5.0
         
-        # Enhanced movement logic
-        if abs(distance) > move_threshold:
-            direction = self.right if distance > 0 else self.left
-            
-            # Track consecutive moves for momentum
-            if direction == self._last_move_direction:
-                self._consecutive_moves += 1
-            else:
-                self._consecutive_moves = 1
-                self._last_move_direction = direction
-            
-            # In precision mode with large distances, allow faster movement
-            if precision_mode and abs(distance) > 8:
-                # Continue moving aggressively when far from target in critical situations
-                return direction
-            elif precision_mode and abs(distance) > 3:
-                # Moderate movement when getting closer
-                return direction
-            elif not precision_mode or abs(distance) > move_threshold:
-                # Normal movement
-                return direction
-            else:
-                # Fine positioning - occasionally skip moves for precision
-                if self._consecutive_moves % 3 == 0 and abs(distance) < 2:
-                    return self.noop
-                return direction
+        # Move if distance exceeds threshold
+        if abs(distance) > threshold:
+            return self.right if distance > 0 else self.left
         else:
-            # Reset movement tracking when stopped
-            self._consecutive_moves = 0
-            self._last_move_direction = None
             return self.noop
 
     def _find_paddle_x(self, obs):
-        """Find paddle center position with improved detection."""
-        # Check multiple rows for paddle
-        paddle_rows = [189, 188, 190, 187, 191]
+        """Find paddle center position with multi-row detection."""
+        # Check multiple rows around paddle area
+        paddle_rows = [189, 188, 190, 187]
         
         for row in paddle_rows:
             if row < obs.shape[0]:
                 paddle_row = obs[row, :, :]
                 
-                # Look for bright pixels
+                # Look for paddle color (bright pixels)
                 brightness = np.max(paddle_row, axis=1)
-                paddle_pixels = brightness > 130
+                paddle_mask = brightness > 120
                 
-                # Find continuous regions
-                coords = np.where(paddle_pixels)[0]
-                if len(coords) >= 10:  # Paddle should be reasonably wide
-                    # Use median for more stable center detection
+                coords = np.where(paddle_mask)[0]
+                if len(coords) >= 8:  # Paddle should be reasonably wide
+                    # Use median for stable center
                     return float(np.median(coords))
         
         # Fallback: return previous position

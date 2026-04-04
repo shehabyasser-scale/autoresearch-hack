@@ -17,7 +17,7 @@ from prepare import GAME, TIME_BUDGET, make_env, evaluate_agent
 # ---------------------------------------------------------------------------
 
 class Agent:
-    # Physics-aware positioning with adaptive timing and wall bounce prediction
+    # Simplified robust tracking with improved trajectory prediction and adaptive positioning
     """
     Atari Breakout agent.
 
@@ -41,284 +41,239 @@ class Agent:
         """Called at the start of each episode."""
         self._steps = 0
         self._fired = False
-        self._ball_history = []
-        self._velocity_history = []
+        self._ball_positions = []
         self._no_ball_count = 0
-        self._predicted_ball_x = None
-        self._paddle_momentum = 0
         self._last_paddle_x = 80.0
-        self._confidence_score = 0
-        self._frame_buffer = []
-        self._last_known_ball_x = None
-        self._emergency_mode = False
-        self._ball_y_history = []
-        self._wall_bounce_prediction = None
-        self._reaction_delay = 0
-        self._game_phase = "early"  # early, mid, late
+        self._trajectory_confidence = 0.0
+        self._last_action = self.noop
+        self._action_momentum = 0
+        self._ball_lost_frames = 0
 
     def act(self, obs):
         """
         Given a (210, 160, 3) uint8 RGB observation, return an action.
-
-        Physics-aware strategy with wall bounce prediction and adaptive timing.
+        
+        Simplified robust strategy focusing on reliable ball tracking and smart positioning.
         """
         self._steps += 1
-
-        # Determine game phase
-        if self._steps < 100:
-            self._game_phase = "early"
-        elif self._steps < 500:
-            self._game_phase = "mid"
-        else:
-            self._game_phase = "late"
 
         # Fire to launch the ball at the start
         if not self._fired:
             self._fired = True
             return self.fire
 
-        # Store frame for multi-frame analysis
-        self._frame_buffer.append(obs.copy())
-        if len(self._frame_buffer) > 4:
-            self._frame_buffer.pop(0)
-
-        # Find ball position and y-coordinate
-        ball_pos = self._find_ball_position_enhanced(obs)
-        
-        if ball_pos is None:
-            self._no_ball_count += 1
-            self._confidence_score = max(0, self._confidence_score - 0.3)
-            
-            # Use physics prediction if available
-            if self._wall_bounce_prediction is not None and self._confidence_score > 0.2:
-                ball_x = self._wall_bounce_prediction
-                ball_x = max(8, min(152, ball_x))
-            elif len(self._ball_history) >= 3 and self._predicted_ball_x is not None:
-                ball_x = self._predicted_ball_x
-                ball_x = max(8, min(152, ball_x))
-            else:
-                ball_x = None
-            
-            if ball_x is None:
-                # Emergency recovery
-                if self._no_ball_count > 20:
-                    self._emergency_mode = True
-                    return self.fire
-                
-                # Center positioning during ball loss
-                paddle_x = self._find_paddle_x(obs)
-                center_x = 80
-                if abs(paddle_x - center_x) > 25:
-                    return self.right if center_x > paddle_x else self.left
-                return self.noop
-        else:
-            ball_x, ball_y = ball_pos
-            self._no_ball_count = 0
-            self._confidence_score = min(1.0, self._confidence_score + 0.6)
-            self._last_known_ball_x = ball_x
-            self._emergency_mode = False
-
-        # Update ball history with both x and y
-        self._ball_history.append(ball_x)
-        if ball_pos is not None:
-            self._ball_y_history.append(ball_pos[1])
-        if len(self._ball_history) > 10:
-            self._ball_history.pop(0)
-        if len(self._ball_y_history) > 10:
-            self._ball_y_history.pop(0)
-
-        # Enhanced velocity computation with physics awareness
-        velocity_x = 0
-        velocity_y = 0
-        
-        if len(self._ball_history) >= 4:
-            # X velocity with outlier filtering
-            positions_x = np.array(self._ball_history[-6:])
-            diffs_x = np.diff(positions_x)
-            if len(diffs_x) >= 3:
-                median_diff = np.median(diffs_x)
-                mad = np.median(np.abs(diffs_x - median_diff))
-                if mad > 0:
-                    outlier_mask = np.abs(diffs_x - median_diff) < 2.5 * mad
-                    if np.sum(outlier_mask) >= 2:
-                        velocity_x = np.mean(diffs_x[outlier_mask])
-                    else:
-                        velocity_x = median_diff
-                else:
-                    velocity_x = median_diff
-        
-        if len(self._ball_y_history) >= 4:
-            # Y velocity for physics prediction
-            positions_y = np.array(self._ball_y_history[-6:])
-            diffs_y = np.diff(positions_y)
-            if len(diffs_y) >= 2:
-                velocity_y = np.mean(diffs_y[-3:])
-        
-        self._velocity_history.append(velocity_x)
-        if len(self._velocity_history) > 6:
-            self._velocity_history.pop(0)
-
-        # Physics-based wall bounce prediction
-        self._wall_bounce_prediction = self._predict_wall_bounce(ball_x, velocity_x)
-
-        # Find paddle position
+        # Find ball and paddle positions
+        ball_pos = self._find_ball_robust(obs)
         paddle_x = self._find_paddle_x(obs)
         self._last_paddle_x = paddle_x
 
-        # Adaptive reaction timing based on game phase and ball speed
-        ball_speed = abs(velocity_x)
-        if self._game_phase == "early":
-            base_lookahead = 3.0
-            reaction_threshold = 1.5
-        elif self._game_phase == "mid":
-            base_lookahead = 2.5
-            reaction_threshold = 1.8
-        else:  # late game - more aggressive
-            base_lookahead = 2.0
-            reaction_threshold = 2.2
-
-        # Enhanced lookahead with physics consideration
-        speed_factor = min(3.0, ball_speed * 0.8)
-        confidence_factor = self._confidence_score ** 0.5
-        
-        # Use wall bounce prediction if available and confident
-        if self._wall_bounce_prediction is not None and self._confidence_score > 0.4:
-            target_x = self._wall_bounce_prediction
+        if ball_pos is None:
+            self._no_ball_count += 1
+            self._ball_lost_frames += 1
+            self._trajectory_confidence = max(0, self._trajectory_confidence - 0.4)
+            
+            # Emergency ball recovery
+            if self._ball_lost_frames > 15:
+                return self.fire
+            
+            # Use last known trajectory if confident
+            if len(self._ball_positions) >= 3 and self._trajectory_confidence > 0.3:
+                predicted_x = self._predict_intercept()
+                if predicted_x is not None:
+                    return self._move_towards_target(paddle_x, predicted_x, urgent=True)
+            
+            # Default to center when completely lost
+            return self._move_towards_target(paddle_x, 80, urgent=False)
         else:
-            lookahead = base_lookahead + speed_factor * confidence_factor
-            target_x = ball_x + velocity_x * lookahead
+            ball_x, ball_y = ball_pos
+            self._no_ball_count = 0
+            self._ball_lost_frames = 0
+            self._trajectory_confidence = min(1.0, self._trajectory_confidence + 0.5)
 
-        # Adaptive positioning strategy
-        target_offset = target_x - paddle_x
-        
-        # Dynamic threshold based on ball speed and Y position
-        speed_threshold = min(2.5, ball_speed * 0.5)
-        threshold = reaction_threshold + speed_threshold * confidence_factor
-        
-        # Add Y-position based urgency
-        if ball_pos is not None and ball_pos[1] > 70:  # Ball getting close to paddle
-            threshold *= 0.7  # React faster when ball is close
-            
-        # Enhanced momentum system with physics awareness
-        if abs(target_offset) > threshold:
-            desired_direction = 1 if target_offset > 0 else -1
-            
-            # Stronger momentum for high-speed balls
-            momentum_strength = 0.9 if ball_speed > 2.0 else 0.7
-            self._paddle_momentum = momentum_strength * self._paddle_momentum + (1 - momentum_strength) * desired_direction
-            
-            # Movement decision with speed-adaptive threshold
-            move_threshold = 0.2 if ball_speed > 2.5 else 0.3
-            
-            if self._paddle_momentum > move_threshold:
-                return self.right
-            elif self._paddle_momentum < -move_threshold:
-                return self.left
-            else:
-                return self.noop
-        else:
-            # Fine positioning near target
-            self._paddle_momentum *= 0.5
-            
-            # Precision control
-            if abs(target_offset) > 1.0:
-                return self.right if target_offset > 0 else self.left
-            else:
-                return self.noop
+        # Update ball position history
+        self._ball_positions.append((ball_x, ball_y, self._steps))
+        if len(self._ball_positions) > 8:
+            self._ball_positions.pop(0)
 
-    def _predict_wall_bounce(self, ball_x, velocity_x):
-        """Predict ball position after wall bounces."""
-        if abs(velocity_x) < 0.5:
-            return None
-            
-        # Simulate ball movement with wall bounces
-        sim_x = ball_x
-        sim_vx = velocity_x
-        steps_ahead = 15
+        # Calculate target position based on ball trajectory
+        target_x = self._calculate_target_position(ball_x, ball_y)
         
-        for _ in range(steps_ahead):
-            sim_x += sim_vx
-            
-            # Check for wall collision
-            if sim_x <= 8:  # Left wall
-                sim_x = 8 + (8 - sim_x)
-                sim_vx = -sim_vx * 0.95  # Slight energy loss
-            elif sim_x >= 152:  # Right wall
-                sim_x = 152 - (sim_x - 152)
-                sim_vx = -sim_vx * 0.95
-                
-        return sim_x
+        # Determine urgency based on ball Y position
+        urgent = ball_y > 60  # Ball is getting close to paddle level
+        
+        return self._move_towards_target(paddle_x, target_x, urgent)
 
-    def _find_ball_position_enhanced(self, obs):
-        """Enhanced ball detection returning both x and y coordinates."""
-        # Ball region: between bricks and paddle
-        field = obs[95:185, 8:152, :]
+    def _find_ball_robust(self, obs):
+        """Robust ball detection focusing on consistency."""
+        # Focus on the main game area
+        field = obs[95:180, 8:152, :]
         
-        # Multi-criteria detection
-        r_bright = field[:, :, 0] > 170
-        g_bright = field[:, :, 1] > 170
-        b_bright = field[:, :, 2] > 170
+        # Look for bright pixels (ball is typically white/bright)
+        brightness = np.max(field, axis=2)
+        bright_pixels = brightness > 180
         
-        # Ball is typically bright in multiple channels
-        bright_multi = (r_bright.astype(int) + g_bright.astype(int) + b_bright.astype(int)) >= 2
-        
-        # Very bright pixels
-        very_bright = np.max(field, axis=2) > 195
-        
-        # White-like pixels
-        white_like = (field[:, :, 0] > 175) & (field[:, :, 1] > 175) & (field[:, :, 2] > 175)
+        # Also check for high contrast pixels
+        r, g, b = field[:, :, 0], field[:, :, 1], field[:, :, 2]
+        white_like = (r > 170) & (g > 170) & (b > 170)
         
         # Combine criteria
-        ball_candidates = bright_multi | very_bright | white_like
-        
+        ball_candidates = bright_pixels | white_like
         coords = np.argwhere(ball_candidates)
         
         if len(coords) == 0:
-            return self._find_ball_multiframe(obs)
+            return None
             
-        # Size filtering
-        if len(coords) > 25:
-            strict_candidates = very_bright | white_like
-            strict_coords = np.argwhere(strict_candidates)
-            if len(strict_coords) > 0 and len(strict_coords) <= 12:
+        # Filter by size - ball should be small
+        if len(coords) > 20:
+            # Try stricter criteria
+            very_bright = brightness > 200
+            strict_coords = np.argwhere(very_bright)
+            if len(strict_coords) > 0 and len(strict_coords) <= 15:
                 coords = strict_coords
             else:
                 return None
         
-        # Return center of mass
-        if len(coords) <= 12:
-            y_pos = float(np.mean(coords[:, 0]))
-            x_pos = float(np.mean(coords[:, 1])) + 8
-            return (x_pos, y_pos)
+        if len(coords) <= 15:
+            y_center = float(np.mean(coords[:, 0])) + 95  # Adjust for field offset
+            x_center = float(np.mean(coords[:, 1])) + 8   # Adjust for field offset
+            return (x_center, y_center)
             
         return None
 
-    def _find_ball_multiframe(self, obs):
-        """Multi-frame ball detection fallback."""
-        if len(self._frame_buffer) >= 2:
-            prev_frame = self._frame_buffer[-2]
-            current_frame = obs
+    def _calculate_target_position(self, ball_x, ball_y):
+        """Calculate where paddle should be positioned."""
+        if len(self._ball_positions) < 3:
+            return ball_x
             
-            diff = np.abs(current_frame.astype(float) - prev_frame.astype(float))
-            field_diff = diff[95:185, 8:152, :]
+        # Calculate velocity from recent positions
+        recent_positions = self._ball_positions[-4:]
+        if len(recent_positions) >= 2:
+            # Use linear regression for more stable velocity estimation
+            times = np.array([pos[2] for pos in recent_positions])
+            x_positions = np.array([pos[0] for pos in recent_positions])
             
-            movement = np.max(field_diff, axis=2) > 25
-            coords = np.argwhere(movement)
-            
-            if len(coords) > 0 and len(coords) < 15:
-                y_pos = float(np.mean(coords[:, 0]))
-                x_pos = float(np.mean(coords[:, 1])) + 8
-                return (x_pos, y_pos)
+            if len(times) >= 3:
+                # Fit line to get velocity
+                dt = times - times[0]
+                if dt[-1] > 0:
+                    velocity_x = np.polyfit(dt, x_positions, 1)[0]
+                else:
+                    velocity_x = 0
+            else:
+                velocity_x = (x_positions[-1] - x_positions[0]) / max(1, times[-1] - times[0])
+        else:
+            velocity_x = 0
+
+        # Predict intercept position
+        predicted_x = self._predict_intercept_simple(ball_x, ball_y, velocity_x)
         
-        return None
+        return predicted_x
+
+    def _predict_intercept_simple(self, ball_x, ball_y, velocity_x):
+        """Simple physics-based intercept prediction."""
+        paddle_y = 189  # Approximate paddle Y position
+        
+        if ball_y >= paddle_y:
+            return ball_x
+            
+        # Estimate time to reach paddle
+        frames_to_paddle = max(1, (paddle_y - ball_y) / 2.0)  # Assume ball moves ~2 pixels down per frame
+        
+        # Project ball position accounting for wall bounces
+        predicted_x = ball_x + velocity_x * frames_to_paddle
+        
+        # Handle wall bounces
+        game_width = 152 - 8  # Playable width
+        left_wall = 8
+        right_wall = 152
+        
+        # Simulate bounces
+        while predicted_x < left_wall or predicted_x > right_wall:
+            if predicted_x < left_wall:
+                predicted_x = left_wall + (left_wall - predicted_x)
+                velocity_x = -velocity_x * 0.9  # Slight energy loss
+            elif predicted_x > right_wall:
+                predicted_x = right_wall - (predicted_x - right_wall)
+                velocity_x = -velocity_x * 0.9
+        
+        return predicted_x
+
+    def _predict_intercept(self):
+        """Predict intercept using stored trajectory data."""
+        if len(self._ball_positions) < 3:
+            return None
+            
+        # Get recent positions
+        recent = self._ball_positions[-3:]
+        x_positions = [pos[0] for pos in recent]
+        y_positions = [pos[1] for pos in recent]
+        
+        # Calculate average velocity
+        dx = (x_positions[-1] - x_positions[0]) / max(1, len(recent) - 1)
+        dy = (y_positions[-1] - y_positions[0]) / max(1, len(recent) - 1)
+        
+        if abs(dy) < 0.1:  # Ball moving horizontally
+            return x_positions[-1]
+            
+        # Predict intercept
+        current_y = y_positions[-1]
+        paddle_y = 189
+        frames_to_intercept = (paddle_y - current_y) / max(0.1, dy)
+        
+        if frames_to_intercept > 0:
+            predicted_x = x_positions[-1] + dx * frames_to_intercept
+            # Simple wall bounce
+            if predicted_x < 8:
+                predicted_x = 16 - predicted_x
+            elif predicted_x > 152:
+                predicted_x = 304 - predicted_x
+            return max(8, min(152, predicted_x))
+            
+        return x_positions[-1]
+
+    def _move_towards_target(self, paddle_x, target_x, urgent=False):
+        """Move paddle towards target with momentum and urgency consideration."""
+        distance = target_x - paddle_x
+        
+        # Adjust threshold based on urgency and confidence
+        base_threshold = 2.0
+        if urgent:
+            threshold = base_threshold * 0.6
+        else:
+            threshold = base_threshold * (1.2 - self._trajectory_confidence * 0.4)
+        
+        # Apply momentum for smoother movement
+        if abs(distance) > threshold:
+            desired_direction = 1 if distance > 0 else -1
+            momentum_factor = 0.7 if urgent else 0.5
+            self._action_momentum = momentum_factor * self._action_momentum + (1 - momentum_factor) * desired_direction
+            
+            move_threshold = 0.3 if urgent else 0.4
+            
+            if self._action_momentum > move_threshold:
+                return self.right
+            elif self._action_momentum < -move_threshold:
+                return self.left
+            else:
+                return self.noop
+        else:
+            # Fine positioning
+            self._action_momentum *= 0.6
+            if abs(distance) > 1.0:
+                return self.right if distance > 0 else self.left
+            else:
+                return self.noop
 
     def _find_paddle_x(self, obs):
-        """Find paddle x-center with fallback."""
-        paddle_strip = obs[189:194, :, :]
-        bright = np.max(paddle_strip, axis=2) > 180
-        coords = np.argwhere(bright)
+        """Find paddle x-center."""
+        paddle_region = obs[189:195, :, :]
+        brightness = np.max(paddle_region, axis=2)
+        bright_pixels = brightness > 150
+        coords = np.argwhere(bright_pixels)
+        
         if len(coords) == 0:
             return self._last_paddle_x
+            
         return float(np.mean(coords[:, 1]))
 
 

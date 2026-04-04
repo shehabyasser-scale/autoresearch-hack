@@ -17,7 +17,7 @@ from prepare import GAME, TIME_BUDGET, make_env, evaluate_agent
 # ---------------------------------------------------------------------------
 
 class Agent:
-    # Simplified but more aggressive ball tracking with dynamic paddle speed control
+    # Enhanced velocity prediction with multi-frame smoothing and adaptive positioning
     """
     Atari Breakout agent.
 
@@ -47,10 +47,12 @@ class Agent:
         self._last_ball_y = 0
         self._ball_moving_down = False
         self._emergency_mode = False
+        self._velocity_history = []
+        self._consistent_velocity = None
 
     def act(self, obs):
         """
-        Simplified but aggressive ball tracking with dynamic response.
+        Enhanced ball tracking with improved velocity prediction.
         """
         self._steps += 1
 
@@ -68,7 +70,7 @@ class Agent:
             self._emergency_mode = True
             
             # Emergency: fire if ball lost too long
-            if self._ball_lost_count > 20:
+            if self._ball_lost_count > 15:
                 return self.fire
                 
             # Move to center when ball is lost
@@ -83,18 +85,18 @@ class Agent:
             self._ball_lost_count = 0
             self._emergency_mode = False
 
-        # Track ball movement
-        self._update_ball_tracking(ball_x, ball_y)
+        # Track ball movement with enhanced velocity calculation
+        self._update_ball_tracking_enhanced(ball_x, ball_y)
         
         # Determine if ball is moving toward paddle
         self._ball_moving_down = ball_y > self._last_ball_y
         self._last_ball_y = ball_y
 
-        # Calculate target position with prediction
-        target_x = self._calculate_target_aggressive(ball_x, ball_y)
+        # Calculate target position with enhanced prediction
+        target_x = self._calculate_target_enhanced(ball_x, ball_y)
         
         # Dynamic paddle control based on urgency
-        return self._move_paddle_dynamic(target_x, ball_y)
+        return self._move_paddle_adaptive(target_x, ball_y, ball_x)
 
     def _find_ball_robust(self, obs):
         """Robust ball detection using multiple criteria."""
@@ -132,30 +134,63 @@ class Agent:
             
         return (x_center, y_center)
 
-    def _update_ball_tracking(self, ball_x, ball_y):
-        """Update ball position history for velocity calculation."""
+    def _update_ball_tracking_enhanced(self, ball_x, ball_y):
+        """Enhanced ball position history with velocity smoothing."""
         self._ball_history.append((ball_x, ball_y, self._steps))
         
         # Keep only recent history
-        if len(self._ball_history) > 8:
+        if len(self._ball_history) > 10:
             self._ball_history.pop(0)
+            
+        # Calculate and smooth velocity
+        if len(self._ball_history) >= 4:
+            # Use multiple frame pairs for velocity calculation
+            velocities = []
+            for i in range(len(self._ball_history) - 3, len(self._ball_history)):
+                if i >= 3:
+                    dt = max(1, self._ball_history[i][2] - self._ball_history[i-3][2])
+                    vx = (self._ball_history[i][0] - self._ball_history[i-3][0]) / dt
+                    vy = (self._ball_history[i][1] - self._ball_history[i-3][1]) / dt
+                    velocities.append((vx, vy))
+            
+            if velocities:
+                # Average recent velocities for smoothing
+                avg_vx = np.mean([v[0] for v in velocities])
+                avg_vy = np.mean([v[1] for v in velocities])
+                
+                self._velocity_history.append((avg_vx, avg_vy))
+                if len(self._velocity_history) > 5:
+                    self._velocity_history.pop(0)
+                    
+                # Check for consistent velocity pattern
+                if len(self._velocity_history) >= 3:
+                    recent_vx = [v[0] for v in self._velocity_history[-3:]]
+                    recent_vy = [v[1] for v in self._velocity_history[-3:]]
+                    
+                    if np.std(recent_vx) < 0.5 and np.std(recent_vy) < 0.5:
+                        self._consistent_velocity = (np.mean(recent_vx), np.mean(recent_vy))
+                    else:
+                        self._consistent_velocity = None
 
-    def _calculate_target_aggressive(self, ball_x, ball_y):
-        """Calculate target position with aggressive prediction."""
+    def _calculate_target_enhanced(self, ball_x, ball_y):
+        """Enhanced target calculation with better velocity prediction."""
         # If ball is high up, just track it
-        if ball_y < 120:
+        if ball_y < 115:
             return ball_x
             
-        # Calculate velocity if we have history
-        if len(self._ball_history) >= 3:
-            recent = self._ball_history[-3:]
-            vx = (recent[-1][0] - recent[0][0]) / max(1, recent[-1][2] - recent[0][2])
-            vy = (recent[-1][1] - recent[0][1]) / max(1, recent[-1][2] - recent[0][2])
+        # Use consistent velocity if available, otherwise calculate fresh
+        if self._consistent_velocity is not None:
+            vx, vy = self._consistent_velocity
+        elif len(self._ball_history) >= 4:
+            recent = self._ball_history[-4:]
+            dt = max(1, recent[-1][2] - recent[0][2])
+            vx = (recent[-1][0] - recent[0][0]) / dt
+            vy = (recent[-1][1] - recent[0][1]) / dt
         else:
             return ball_x
             
-        # Only predict if ball is moving down
-        if vy <= 0:
+        # Only predict if ball is moving down significantly
+        if vy <= 0.3:
             return ball_x
             
         # Predict where ball will be at paddle level
@@ -164,53 +199,65 @@ class Agent:
         
         predicted_x = ball_x + vx * time_to_paddle
         
-        # Handle wall bounces
+        # Enhanced wall bounce calculation
         left_wall, right_wall = 8, 152
         
-        # Simple bounce calculation
-        if predicted_x < left_wall:
-            predicted_x = left_wall + (left_wall - predicted_x)
-        elif predicted_x > right_wall:
-            predicted_x = right_wall - (predicted_x - right_wall)
+        # Handle multiple bounces if ball is moving very fast
+        while predicted_x < left_wall or predicted_x > right_wall:
+            if predicted_x < left_wall:
+                predicted_x = left_wall + (left_wall - predicted_x)
+                vx = -vx  # Reverse velocity after bounce
+            elif predicted_x > right_wall:
+                predicted_x = right_wall - (predicted_x - right_wall)
+                vx = -vx  # Reverse velocity after bounce
+                
+        # Adaptive lead based on ball speed and consistency
+        if abs(vx) > 0.8:
+            confidence = 1.0 if self._consistent_velocity else 0.6
+            lead_factor = min(10, abs(vx) * 3) * confidence
+            lead = lead_factor * (1 if vx > 0 else -1)
+            predicted_x += lead * 0.4
             
-        # Add lead based on ball speed and direction
-        if abs(vx) > 1:
-            lead = min(8, abs(vx) * 2) * (1 if vx > 0 else -1)
-            predicted_x += lead * 0.6
-            
-        # Clamp to playfield
-        predicted_x = max(15, min(145, predicted_x))
+        # Smart positioning based on ball trajectory
+        if ball_y > 150:  # Ball is close, be more precise
+            predicted_x = max(20, min(140, predicted_x))
+        else:  # Ball is farther, allow wider range
+            predicted_x = max(15, min(145, predicted_x))
         
         return predicted_x
 
-    def _move_paddle_dynamic(self, target_x, ball_y):
-        """Dynamic paddle movement based on urgency."""
+    def _move_paddle_adaptive(self, target_x, ball_y, ball_x):
+        """Adaptive paddle movement with context-aware thresholds."""
         distance = target_x - self._paddle_x
         
-        # Determine urgency based on ball position and movement
-        urgent = (ball_y > 160) or (self._ball_moving_down and ball_y > 140)
-        very_urgent = ball_y > 175
+        # Calculate urgency with multiple factors
+        y_urgency = max(0, (ball_y - 140) / 45)  # 0 to 1 based on y position
         
-        # Dynamic thresholds
-        if very_urgent:
-            threshold = 0.5
-        elif urgent:
-            threshold = 1.5
-        else:
-            threshold = 3.0
-            
-        # More aggressive movement when urgent
-        if abs(distance) > threshold:
-            if distance > 0:
-                return self.right
-            else:
-                return self.left
-        else:
-            # Fine positioning
-            if abs(distance) > 0.8:
+        # Add horizontal urgency if ball is moving away
+        h_urgency = 0
+        if len(self._ball_history) >= 2:
+            last_x = self._ball_history[-2][0]
+            if abs(ball_x - self._paddle_x) > abs(last_x - self._paddle_x):
+                h_urgency = 0.3
+        
+        total_urgency = min(1.0, y_urgency + h_urgency)
+        
+        # Dynamic thresholds based on urgency
+        base_threshold = 4.0 - 3.5 * total_urgency  # 4.0 when calm, 0.5 when urgent
+        fine_threshold = base_threshold * 0.3
+        
+        # Movement decision with adaptive sensitivity
+        if abs(distance) > base_threshold:
+            return self.right if distance > 0 else self.left
+        elif abs(distance) > fine_threshold:
+            # Probability-based fine movement for smoother control
+            move_prob = abs(distance) / base_threshold
+            if move_prob > 0.4:  # Move if distance is significant enough
                 return self.right if distance > 0 else self.left
             else:
                 return self.noop
+        else:
+            return self.noop
 
     def _find_paddle_x(self, obs):
         """Find paddle x-center position."""

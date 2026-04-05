@@ -38,6 +38,7 @@ AGENT_FILE = os.path.join(ATARI_DIR, "agent.py")
 PREPARE_FILE = os.path.join(ATARI_DIR, "prepare.py")
 RESULTS_FILE = os.path.join(ATARI_DIR, "results.tsv")
 RUN_LOG = os.path.join(ATARI_DIR, "run.log")
+VIDEOS_DIR = os.path.join(ATARI_DIR, "videos")
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +111,62 @@ def run_evaluation():
         return None, output
 
     return float(match.group(1)), output
+
+
+# ---------------------------------------------------------------------------
+# Video recording
+# ---------------------------------------------------------------------------
+
+def record_video(experiment_num, mean_reward, num_episodes=1):
+    """Record a short video of the current agent playing, saved to videos/."""
+    try:
+        import gymnasium as gym
+        import ale_py  # noqa: F401
+        import importlib
+        import importlib.util
+
+        os.makedirs(VIDEOS_DIR, exist_ok=True)
+
+        # Import agent module fresh (it may have been rewritten)
+        spec = importlib.util.spec_from_file_location("agent_mod", AGENT_FILE)
+        agent_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(agent_mod)
+
+        env = gym.make(
+            "ALE/Breakout-v5",
+            render_mode="rgb_array",
+            frameskip=1,
+            repeat_action_probability=0.25,
+        )
+
+        prefix = f"exp{experiment_num:04d}_reward{mean_reward:.0f}"
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=VIDEOS_DIR,
+            name_prefix=prefix,
+            episode_trigger=lambda ep: ep < num_episodes,
+        )
+
+        agent = agent_mod.Agent(env.action_space)
+
+        for ep in range(num_episodes):
+            obs, info = env.reset(seed=42 + ep)
+            if hasattr(agent, "reset"):
+                agent.reset()
+
+            steps = 0
+            while True:
+                action = agent.act(obs)
+                obs, reward, terminated, truncated, info = env.step(action)
+                steps += 1
+                if terminated or truncated or steps >= 10_000:
+                    break
+
+        env.close()
+        print(f"[video] Saved to {VIDEOS_DIR}/{prefix}*.mp4")
+
+    except Exception as e:
+        print(f"[video] Recording failed (non-fatal): {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +386,10 @@ Examples:
     baseline_commit = git_short_hash()
     log_result(baseline_commit, best_reward, "keep", "baseline heuristic")
     print(f"[baseline] mean_reward={best_reward:.4f}")
+
+    # Record baseline video
+    print(f"[video] Recording baseline gameplay...")
+    record_video(0, best_reward)
     print()
 
     # --- Experiment loop ---
@@ -410,6 +471,10 @@ Examples:
             best_reward = mean_reward
             best_code = new_code
             kept += 1
+
+            # Record a video of the improved agent
+            print(f"[video] Recording gameplay...")
+            record_video(experiment, mean_reward)
 
         else:
             # No improvement

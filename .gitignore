@@ -23,3 +23,4 @@ dev/
 results.tsv
 atari/run.log
 atari/results.tsv
+atari/videos/

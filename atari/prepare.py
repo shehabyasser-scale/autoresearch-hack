@@ -29,7 +29,7 @@ import ale_py  # noqa: F401 — registers ALE environments
 GAME = "ALE/Breakout-v5"          # the game to optimize
 NUM_EVAL_EPISODES = 30            # episodes per evaluation (enough for stable mean)
 MAX_STEPS_PER_EPISODE = 10_000    # cap per episode to prevent infinite loops
-TIME_BUDGET = 300                 # 5-minute budget for agent.py's train() function
+TIME_BUDGET = 3600                # 1-hour budget for agent.py's train() function
 SEED = 42                         # fixed seed for reproducible evaluation
 
 # ---------------------------------------------------------------------------

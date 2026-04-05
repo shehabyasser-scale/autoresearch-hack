@@ -87,6 +87,12 @@ I think these would be the reasonable hyperparameters to play with. Ask your fav
 - [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
 - [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
 
+## Architecture
+
+For a comprehensive visual guide to how the system works — with 20 Mermaid diagrams covering flowcharts, sequence diagrams, state machines, class diagrams, ER diagrams, journey maps, and more — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+
+For Atari-specific documentation including run analysis, video recording, and result visualization, see **[atari/README.md](atari/README.md)**.
+
 ## License
 
 MIT

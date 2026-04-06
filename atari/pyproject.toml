@@ -11,4 +11,5 @@ dependencies = [
     "litellm>=1.0.0",
     "tenacity>=8.0.0",
     "matplotlib>=3.5.0",
+    "moviepy>=2.0.0",
 ]

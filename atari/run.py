@@ -176,12 +176,14 @@ def record_video(experiment_num, mean_reward, num_episodes=1):
 def init_results():
     if not os.path.exists(RESULTS_FILE):
         with open(RESULTS_FILE, "w") as f:
-            f.write("commit\tmean_reward\tstatus\tdescription\n")
+            f.write("commit\tmean_reward\tstatus\tdescription\terror\n")
 
 
-def log_result(commit, mean_reward, status, description):
+def log_result(commit, mean_reward, status, description, error=""):
+    # Sanitize error for TSV (collapse whitespace, remove tabs/newlines)
+    error_clean = " ".join(error.split())[:200] if error else ""
     with open(RESULTS_FILE, "a") as f:
-        f.write(f"{commit}\t{mean_reward:.4f}\t{status}\t{description}\n")
+        f.write(f"{commit}\t{mean_reward:.4f}\t{status}\t{description}\t{error_clean}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +245,23 @@ agent.py file between ```python and ``` markers. No other text."""
 
 def build_prompt(agent_code, results_history, best_reward, attempt_num):
     """Build the prompt for the LLM."""
+    # Extract recent crash errors to help the LLM avoid repeating them
+    crash_warnings = ""
+    if results_history:
+        recent_crashes = []
+        for line in results_history.strip().split("\n")[-20:]:  # last 20 experiments
+            parts = line.split("\t")
+            if len(parts) >= 5 and parts[2] == "crash" and parts[4].strip():
+                recent_crashes.append(parts[4].strip())
+        if recent_crashes:
+            # Deduplicate
+            unique_crashes = list(dict.fromkeys(recent_crashes))[-5:]
+            crash_warnings = "\n\nRECENT CRASH ERRORS (avoid these!):\n"
+            for err in unique_crashes:
+                crash_warnings += f"  - {err}\n"
+            crash_warnings += "\nCommon fixes: use integer slices (not float), ensure obs is a numpy array \
+(not tuple) before indexing, verify tensor shapes match between layers.\n"
+
     prompt = f"""Here is the current agent.py (best so far, mean_reward={best_reward:.4f}):
 
 ```python
@@ -251,10 +270,13 @@ def build_prompt(agent_code, results_history, best_reward, attempt_num):
 
 Experiment history (most recent last):
 {results_history if results_history else "(no experiments yet — this will be the first modification)"}
-
+{crash_warnings}
 This is experiment #{attempt_num}. Suggest a modification to agent.py that will \
 improve mean_reward. Think about what has worked and what hasn't based on the \
 history. Try something different from previous failed attempts.
+
+IMPORTANT: Make sure your code actually runs without errors. Test edge cases \
+mentally: observation shapes, integer vs float slicing, tensor dimensions.
 
 Respond with the complete new agent.py file between ```python and ``` markers."""
     return prompt
@@ -407,6 +429,8 @@ Examples:
         print(f"  Best so far: {best_reward:.4f} | Kept: {kept} | Discarded: {discarded}")
         print(f"{'='*60}")
 
+        exp_start = time.time()
+
         # Read current results history
         results_history = ""
         if os.path.exists(RESULTS_FILE):
@@ -415,12 +439,16 @@ Examples:
 
         # Ask LLM for a modification
         print("[llm] Asking for modification...")
+        llm_start = time.time()
         prompt = build_prompt(best_code, results_history, best_reward, experiment)
         response = call_llm_with_retry(args.api_key, args.model, prompt, args.api_base)
 
         if response is None:
             print("[llm] All retries exhausted. Skipping experiment.")
             continue
+
+        llm_elapsed = time.time() - llm_start
+        print(f"[llm] Response received in {llm_elapsed:.0f}s")
 
         new_code = extract_code(response)
         if not new_code:
@@ -444,19 +472,31 @@ Examples:
             commit_hash = "nogit"
 
         # Evaluate
+        code_lines = len(new_code.splitlines())
+        has_torch = "import torch" in new_code
+        has_dqn = any(kw in new_code.lower() for kw in ["dqn", "qnetwork", "q_network", "replay"])
         print(f"[eval] Running: {description}")
+        print(f"[eval] Code: {code_lines} lines | torch={'yes' if has_torch else 'no'} | dqn={'yes' if has_dqn else 'no'}")
+        eval_start = time.time()
         try:
             mean_reward, output = run_evaluation()
         except subprocess.TimeoutExpired:
             mean_reward = None
             output = "TIMEOUT: evaluation exceeded 75 minutes"
 
+        eval_elapsed = time.time() - eval_start
+
         if mean_reward is None:
-            # Crash
-            print(f"[eval] CRASHED")
-            error_tail = output[-300:] if output else "no output"
-            print(f"  {error_tail}")
-            log_result(commit_hash, 0.0, "crash", description)
+            # Crash — extract the actual error line
+            error_tail = output[-500:] if output else "no output"
+            # Find the last exception line for a clean error message
+            error_lines = [l.strip() for l in error_tail.splitlines() if l.strip()]
+            error_msg = error_lines[-1] if error_lines else "unknown error"
+
+            print(f"[eval] CRASHED after {eval_elapsed:.0f}s")
+            print(f"[eval] Error: {error_msg}")
+            print(f"  {error_tail[-200:]}")
+            log_result(commit_hash, 0.0, "crash", description, error_msg)
             if not args.no_git:
                 git_reset_hard(pre_commit)
             else:
@@ -466,7 +506,7 @@ Examples:
 
         elif mean_reward > best_reward:
             # Improvement!
-            print(f"[eval] IMPROVED: {best_reward:.4f} -> {mean_reward:.4f} (+{mean_reward - best_reward:.4f})")
+            print(f"[eval] IMPROVED: {best_reward:.4f} -> {mean_reward:.4f} (+{mean_reward - best_reward:.4f}) in {eval_elapsed:.0f}s")
             log_result(commit_hash, mean_reward, "keep", description)
             best_reward = mean_reward
             best_code = new_code
@@ -478,7 +518,7 @@ Examples:
 
         else:
             # No improvement
-            print(f"[eval] No improvement: {mean_reward:.4f} <= {best_reward:.4f}")
+            print(f"[eval] No improvement: {mean_reward:.4f} <= {best_reward:.4f} (ran {eval_elapsed:.0f}s)")
             log_result(commit_hash, mean_reward, "discard", description)
             if not args.no_git:
                 git_reset_hard(pre_commit)
